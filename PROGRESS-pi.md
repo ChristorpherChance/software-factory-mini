@@ -11,7 +11,7 @@
 | Phase | 内容 | 状态 | commit | 验收摘要 |
 |---|---|---|---|---|
 | 0 | agent-service 骨架 + health | ✅ | f3ba9fe | build 通过；/v1/health=200；鉴权 401 正确；建会话 OK；stub 回归 12 绿 |
-| 1 | core/llm.py pi 分支（默认 stub） | ✅(回落已验) | (待填) | stub 12 绿；pi 模式 agent-service 502/未起均回落 stub 不报错；anthropic 路径不受影响。**真实 DeepSeek 路径待 Key 验证** |
+| 1 | core/llm.py pi 分支（默认 stub） | ✅ | 3f3bb7c | stub 12 绿；回落 stub 不 500；anthropic 不受影响；**真实 DeepSeek(deepseek-v4-pro) 端到端打通**（Python pi→agent-service→DeepSeek 出真实非空文本，exit 0）。内容规整留 Phase 3（prompt template）。 |
 | 2 | 真流式 WS | ⬜ | | |
 | 3 | 编排进 Pi + 工具 + internal 端点 | ⬜ | | |
 | 4 | HITL/脱敏/审计/pathGuard 钩子 | ⬜ | | |
