@@ -12,7 +12,7 @@
 |---|---|---|---|---|
 | 0 | agent-service 骨架 + health | ✅ | f3ba9fe | build 通过；/v1/health=200；鉴权 401 正确；建会话 OK；stub 回归 12 绿 |
 | 1 | core/llm.py pi 分支（默认 stub） | ✅ | 3f3bb7c | stub 12 绿；回落 stub 不 500；anthropic 不受影响；**真实 DeepSeek(deepseek-v4-pro) 端到端打通**（Python pi→agent-service→DeepSeek 出真实非空文本，exit 0）。内容规整留 Phase 3（prompt template）。 |
-| 2 | 真流式 WS | ⬜ | | |
+| 2 | 真流式 WS | ✅ | f3f8289 | 装 httpx-ws；messages.py pi 路径消费 agent-service WS token 流。**真实链路**：backend(pi)→WS→DeepSeek，SSE 收 29 个逐 token delta（payload {msg_id,delta,role} 契约不变）。agent-service 停掉后回落假流式（3 delta+end）。stub 12 绿。关键修复：WS message.end 映射自内核 agent_end（非逐个 message_end）；text_delta 提取 ev.delta。 |
 | 3 | 编排进 Pi + 工具 + internal 端点 | ⬜ | | |
 | 4 | HITL/脱敏/审计/pathGuard 钩子 | ⬜ | | |
 | 3.5 | 能力进化双环 + 能力库设置页 | ⬜ | | |

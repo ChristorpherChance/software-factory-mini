@@ -83,10 +83,10 @@ app.post<{ Params: { id: string } }>("/v1/sessions/:id/interrupt", async (req) =
 });
 
 // WS 真流式：客户端 {type:'message',content} / {type:'hitl',...}；服务端推 message.delta/.end/tool.call/hitl.request
-app.get<{ Params: { id: string } }>("/v1/sessions/:id", { websocket: true }, (conn, req) => {
+// @fastify/websocket v10：handler 第一参数直接是 ws 的 WebSocket（socket）。
+app.get<{ Params: { id: string } }>("/v1/sessions/:id", { websocket: true }, (socket, req) => {
   const { id } = req.params;
   const session = manager.ensureSession(id);
-  const socket = (conn as any).socket ?? conn; // @fastify/websocket v10：conn 即 socket
   const unsub = session.subscribe((ev) => {
     try {
       socket.send(JSON.stringify(ev));

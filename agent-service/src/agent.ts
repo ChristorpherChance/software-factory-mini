@@ -97,7 +97,7 @@ export class AgentSession {
     this.agent.subscribe((ev) => {
       switch (ev.type) {
         case "message_update": {
-          // 从 assistantMessageEvent 提取文本增量
+          // 从 assistantMessageEvent 提取文本增量（仅 text_delta，排除 thinking）
           const delta = extractDelta(ev.assistantMessageEvent);
           if (delta) {
             this.lastText += delta;
@@ -105,7 +105,8 @@ export class AgentSession {
           }
           break;
         }
-        case "message_end":
+        case "agent_end":
+          // 整轮结束才发 WS message.end（内核可能跑多个 message_end 子轮，不可逐个转发）
           this.emit({ type: "message.end" });
           break;
         case "tool_execution_start":
@@ -185,18 +186,13 @@ export class AgentSession {
   }
 }
 
-/** 从 pi-ai 的 AssistantMessageEvent 中提取文本增量。 */
+/** 从 pi-ai 的 AssistantMessageEvent 中提取文本增量。
+ *  实测事件形态：{type:"text_delta", delta:string, contentIndex, partial}。
+ *  只取 text_delta（不含 thinking_delta/toolcall_delta，避免把思考/工具入参当正文）。 */
 function extractDelta(ev: unknown): string {
   if (!ev || typeof ev !== "object") return "";
   const e = ev as Record<string, any>;
-  // pi-ai 事件形态：{type:"update", delta:{...}} 或 partial 文本块
-  // 尽量宽容地提取文本，未知形态返回空串（不抛错）。
-  if (typeof e.text === "string") return e.text;
-  if (e.delta && typeof e.delta === "object") {
-    if (typeof e.delta.text === "string") return e.delta.text;
-    if (typeof e.delta.content === "string") return e.delta.content;
-  }
-  if (typeof e.content === "string") return e.content;
+  if (e.type === "text_delta" && typeof e.delta === "string") return e.delta;
   return "";
 }
 
