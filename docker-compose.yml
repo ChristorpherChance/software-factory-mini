@@ -12,9 +12,30 @@ services:
       EVENT_BACKEND: redis
       REDIS_URL: redis://redis:6379/0
       BLOB_DIR: /data/blob
+      # Pi 集成：默认 pi provider；agent-service 不可达时自动回落 stub（铁律#3）
+      LLM_PROVIDER: ${LLM_PROVIDER:-pi}
+      PI_BASE: http://agent-service:9100/v1
+      PI_WS_BASE: ws://agent-service:9100/v1
     depends_on: [postgres, redis]
     volumes: ["blob:/data/blob"]
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  agent-service:
+    build: ./agent-service
+    environment:
+      PORT: "9100"
+      AUTH_BEARER_TOKEN: ${AUTH_BEARER_TOKEN:-dev-single-workspace-token}
+      BACKEND_ORIGIN: http://backend:8000
+      # DeepSeek（OpenAI 兼容）。LLM_API_KEY 仅注入内存，不落盘、不进镜像层（铁律#4）
+      LLM_MODEL: ${LLM_MODEL:-deepseek-v4-pro}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+    # 不硬 depends_on backend（避免循环依赖），靠健康检查 + 退避重试
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9100/v1/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
   frontend:
     build: ./frontend
     environment:
