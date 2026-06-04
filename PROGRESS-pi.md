@@ -14,7 +14,7 @@
 | 1 | core/llm.py pi 分支（默认 stub） | ✅ | 3f3bb7c | stub 12 绿；回落 stub 不 500；anthropic 不受影响；**真实 DeepSeek(deepseek-v4-pro) 端到端打通**（Python pi→agent-service→DeepSeek 出真实非空文本，exit 0）。内容规整留 Phase 3（prompt template）。 |
 | 2 | 真流式 WS | ✅ | c194c2a | 装 httpx-ws；messages.py pi 路径消费 agent-service WS token 流。**真实链路**：backend(pi)→WS→DeepSeek，SSE 收 29 个逐 token delta（payload {msg_id,delta,role} 契约不变）。agent-service 停掉后回落假流式（3 delta+end）。stub 12 绿。关键修复：WS message.end 映射自内核 agent_end（非逐个 message_end）；text_delta 提取 ev.delta。 |
 | 3 | 编排进 Pi + 工具 + internal 端点 | ✅ | 580fed1 | **3a**(4ee082a)：prompt 模板+薄监督器，pi 真实路径 资料→ORD→CRD→PRD，RTM healthScore=1.0 edgeCount=15 orphans=[]。**3b**：5 工具(typebox)+6 internal 端点(artifact/write,events/task,stage/gate,delegate,audit,tooling/parse)全验证。关键修复：三件套生成临时清空 tools（避免 thinking 模型陷工具循环 terminate）。stub 12 绿 |
-| 4 | HITL/脱敏/审计/pathGuard 钩子 | ✅ | (待填) | write 工具受 pathGuard 约束。**真实验证**：诱导 agent write .pi/skills/evil.md → 被 block(write error)，文件未创建；Semi 档诱导 write notes/hello.md → 发 hitl.request，回 deny → 未创建。pathGuard 单测 9/9。审计：afterToolCall→postAudit→internal/audit（端点 Phase 3b 已验落库）。stub 12 绿。注：工具 session_id 注入(自主调工具全链路)留 Phase 3.5 统一解决。 |
+| 4 | HITL/脱敏/审计/pathGuard 钩子 | ✅ | ae1876c | write 工具受 pathGuard 约束。**真实验证**：诱导 agent write .pi/skills/evil.md → 被 block(write error)，文件未创建；Semi 档诱导 write notes/hello.md → 发 hitl.request，回 deny → 未创建。pathGuard 单测 9/9。审计：afterToolCall→postAudit→internal/audit（端点 Phase 3b 已验落库）。stub 12 绿。注：工具 session_id 注入(自主调工具全链路)留 Phase 3.5 统一解决。 |
 | 3.5 | 能力进化双环 + 能力库设置页 | ⬜ | | |
 | 5 | tooling 拆分 | ⬜ | | |
 | 6 | docker-compose + nginx | ⬜ | | |
