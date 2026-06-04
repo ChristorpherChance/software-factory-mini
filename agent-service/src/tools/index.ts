@@ -1,8 +1,17 @@
 // 自定义工具注册表。
-// Phase 0：空（Agent 无工具也能做对话/文本生成，验证 DeepSeek 接通）。
-// Phase 3：注册 parse_material / artifact_write / stage_gate_check / emit_task_event / delegate。
-// Phase 3.5：追加 skill_propose / skill_apply。
-// read/write/edit/bash 由 harness/NodeExecutionEnv 提供，Phase 3/4 放开。
+// read/write/edit/bash 由 harness/NodeExecutionEnv 提供，Phase 4 放开（受 pathGuard 约束）。
+// skill_propose/skill_apply 在 Phase 3.5 追加。
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { parseMaterialTool } from "./parseMaterial.js";
+import { artifactWriteTool } from "./artifactWrite.js";
+import { stageGateCheckTool } from "./stageGate.js";
+import { emitTaskEventTool } from "./emitTaskEvent.js";
+import { delegateTool } from "./delegate.js";
 
-export const allTools: AgentTool<any>[] = [];
+export const allTools: AgentTool<any>[] = [
+  parseMaterialTool,
+  artifactWriteTool,
+  stageGateCheckTool,
+  emitTaskEventTool,
+  delegateTool,
+];

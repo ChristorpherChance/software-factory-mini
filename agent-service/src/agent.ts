@@ -161,28 +161,39 @@ export class AgentSession {
     if (errMsg) throw new Error(`agent error: ${errMsg}`);
   }
 
-  /** 资料结构化：跑一轮，返回结构化 JSON（Phase 3 由 emit 工具回填 lastStructured）。 */
+  /** 资料结构化：纯文本任务，临时清空工具（Phase 5 接 tooling 后再调整）。 */
   async runStructure(text: string): Promise<Record<string, unknown>> {
     this.lastText = "";
     this.lastStructured = null;
-    await this.agent.prompt(`/structure\n${text}`);
-    await this.agent.waitForIdle();
-    this.assertNoError();
-    // 无结构化输出且无文本视为失败（避免空结果伪装成功）
-    if (!this.lastStructured && !this.lastText.trim()) {
-      throw new Error("agent produced empty structure");
+    const savedTools = this.agent.state.tools;
+    this.agent.state.tools = [];
+    try {
+      await this.agent.prompt(`/structure\n${text}`);
+      await this.agent.waitForIdle();
+      this.assertNoError();
+      if (!this.lastStructured && !this.lastText.trim()) {
+        throw new Error("agent produced empty structure");
+      }
+      return this.lastStructured ?? { _raw: this.lastText };
+    } finally {
+      this.agent.state.tools = savedTools;
     }
-    return this.lastStructured ?? { _raw: this.lastText };
   }
 
-  /** 需求生成：跑一轮，返回 markdown 文本。 */
+  /** 需求生成：纯文本输出任务，临时清空工具（避免 thinking 模型陷入工具循环/terminate）。 */
   async runRequirement(kind: string, upstream: string): Promise<string> {
     this.lastText = "";
-    await this.agent.prompt(expandCommand(`/${kind}\n${upstream}`));
-    await this.agent.waitForIdle();
-    this.assertNoError();
-    if (!this.lastText.trim()) throw new Error("agent produced empty requirement");
-    return this.lastText;
+    const savedTools = this.agent.state.tools;
+    this.agent.state.tools = [];
+    try {
+      await this.agent.prompt(expandCommand(`/${kind}\n${upstream}`));
+      await this.agent.waitForIdle();
+      this.assertNoError();
+      if (!this.lastText.trim()) throw new Error("agent produced empty requirement");
+      return this.lastText;
+    } finally {
+      this.agent.state.tools = savedTools;
+    }
   }
 
   /** 普通消息（WS 路径用，不等待，事件实时推）。命令自动展开模板。 */
