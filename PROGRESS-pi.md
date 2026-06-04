@@ -19,7 +19,7 @@
 | 5 | tooling 拆分 | ✅ | 64ed2be | internal/tooling/parse 用真实 detect/extract（类型识别+文本抽取，非LLM）；structured=true 额外 stub 结构化。consistency.double_run_consistent 加 mode：stub=strict(sha256严判)，pi=approx(结构Jaccard≥0.8，超预算不硬失败)。pipeline 按 provider 传 mode。验收：tooling/parse kind=txt+text；双模式单测；poc1 PASS；stub 12 绿。 |
 | 6 | docker-compose + nginx | ✅(静态) | bc785ec | compose 追加 agent-service(build/healthcheck/LLM_API_KEY 仅 env 注入)；backend 加 LLM_PROVIDER=pi/PI_BASE/PI_WS_BASE；nginx 加 agent_service upstream + WS /v1/sessions/ 透传 Upgrade+proxy_buffering off。安全：Dockerfile 不 COPY .env + .dockerignore。**本机无 docker，compose up 未实跑**；YAML/Dockerfile依赖/nginx结构静态校验通过。 |
 | 7 | 确定性基线 + CI | ✅ | 836a0ff | 确定性：agent thinkingLevel=off + model reasoning=false + 双跑 approx（Phase 5）。CI(.github/workflows/ci.yml)：backend-stub(POC-1/集成/E2E 离线严判) + agent-service(build+pathGuard单测) + pi-smoke(workflow_dispatch 手动，需 Secrets.LLM_API_KEY)。模拟 stub job：POC-1 PASS/集成12绿/E2E SMOKE PASS。 |
-| 8 | 回填 PRD/RTM | ✅ | (待填) | docs/PRD-RTM-回填-pi.md：9 条 PRD-F-DSG-01..05 + PRD-NFR-DSG-01..04，上溯手册章节+落地 commit + DoD 对照。RTM 入库验证：9 条 DSG 上溯 R-*，healthScore=1.0 edgeCount=9 orphans=[]。最终 stub 12 绿。 |
+| 8 | 回填 PRD/RTM | ✅ | 8252575 | docs/PRD-RTM-回填-pi.md：9 条 PRD-F-DSG-01..05 + PRD-NFR-DSG-01..04，上溯手册章节+落地 commit + DoD 对照。RTM 入库验证：9 条 DSG 上溯 R-*，healthScore=1.0 edgeCount=9 orphans=[]。最终 stub 12 绿。 |
 
 ## Phase 0 已落盘文件
 - `agent-service/`：package.json, tsconfig.json, Dockerfile, .gitignore, .env.example, models.json
