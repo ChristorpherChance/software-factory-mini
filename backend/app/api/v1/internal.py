@@ -38,11 +38,25 @@ async def _pid_of(db: AsyncSession, session_id: str) -> str:
 
 @router.post("/internal/tooling/parse")
 async def tooling_parse(body: dict, db: AsyncSession = Depends(get_db), _=Depends(require_auth)):
-    """非 LLM 资料抽取（Phase 5 拆 detect/extract 进来）。当前回退 stub 结构化。"""
-    from ...core.llm import _stub_structure
+    """非 LLM 资料抽取（Phase 5）：类型识别 + 文本抽取（OCR/PDF/DOCX/网页），不含 LLM 结构化。
+
+    body: { source, structured?: bool }
+      structured=false（默认）：只返回 { kind, text }（供 Pi 内核做结构化）。
+      structured=true：额外用 stub 结构化（离线确定性，给非 pi 路径用）。
+    """
+    from ...agents.material.detect import detect_type
+    from ...agents.material.extract import extract_text
 
     source = body.get("source", "")
-    return ok(_stub_structure(source))
+    kind = detect_type(source)
+    text = await extract_text(source, kind)
+    out = {"kind": kind, "text": text}
+    if body.get("structured"):
+        from ...core.llm import _stub_structure
+
+        s = _stub_structure(text)
+        out.update(s)
+    return ok(out)
 
 
 @router.post("/internal/artifact/write")

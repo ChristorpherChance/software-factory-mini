@@ -25,7 +25,13 @@ async def parse_material(source: str, session_id: str | None = None) -> dict:
         await publish(
             session_id, "task.update", {"task_id": key[:8], "status": "running", "progress": 40}
         )
-    structured = await double_run_consistent(lambda: llm_structure(text, session_id=session_id))
+    # stub 路径严判 sha256；pi 路径（LLM 非确定）转结构近似比对
+    from ...config import settings
+
+    _mode = "approx" if settings.llm_provider == "pi" else "strict"
+    structured = await double_run_consistent(
+        lambda: llm_structure(text, session_id=session_id), mode=_mode
+    )
     (
         structured["readiness_score"],
         structured["readiness_dimensions"],
