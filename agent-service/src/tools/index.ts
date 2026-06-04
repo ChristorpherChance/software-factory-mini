@@ -7,6 +7,7 @@ import { artifactWriteTool } from "./artifactWrite.js";
 import { stageGateCheckTool } from "./stageGate.js";
 import { emitTaskEventTool } from "./emitTaskEvent.js";
 import { delegateTool } from "./delegate.js";
+import { fileWriteTool } from "./fileWrite.js";
 
 export const allTools: AgentTool<any>[] = [
   parseMaterialTool,
@@ -14,4 +15,5 @@ export const allTools: AgentTool<any>[] = [
   stageGateCheckTool,
   emitTaskEventTool,
   delegateTool,
+  fileWriteTool, // 受 pathGuard 约束（Phase 4）
 ];
