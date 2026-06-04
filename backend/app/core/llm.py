@@ -345,8 +345,15 @@ async def _pi_requirement(kind: str, upstream: str) -> str:
 # ---------------------------------------------------------------------------
 async def structure_material(text: str, session_id: str | None = None) -> dict:
     if settings.llm_provider == "pi":
+        # Phase 3：资料结构化暂用确定性 stub（可靠落库 + 给 ORD 提供稳定上游）。
+        # 资料结构化的 LLM 化（agent-service /structure + parse_material 工具）是 Phase 5 范围，
+        # 届时 _pi_structure 接 Pi 内核 + tooling 抽取后再切回。
         try:
-            return await _pi_structure(text)
+            d = await _pi_structure(text)
+            # 校验返回含必需字段，否则回落 stub（避免 {_raw} 占位污染落库）
+            if isinstance(d, dict) and "readiness_score" in d:
+                return d
+            return _stub_structure(text)
         except Exception:
             return _stub_structure(text)  # 离线兜底（铁律#3）
     if settings.llm_provider == "anthropic" and settings.llm_api_key:

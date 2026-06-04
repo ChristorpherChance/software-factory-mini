@@ -88,17 +88,24 @@ async def _run_orchestrator(sid: str, user_text: str, hitl_mode: str | None):
         aid = str(assistant.id)
         buf = ""
 
-        # Phase 2：pi 路径优先走 WS 真流式
+        # Phase 2/3：pi 路径的薄监督器分流
+        #  - 文档生成类意图（ord/crd/prd/parse_material）：走本地 Orchestrator.handle，
+        #    它内部 generate_requirement 在 pi 模式下打 agent-service /requirement 出规范文档，
+        #    并完成落库 Artifact/Version + RTM 边 + PendingChange（复用现有逻辑，零重写）。
+        #  - 纯对话（chat）：走 agent-service WS 真 token 流式。
         if settings.llm_provider == "pi":
-            try:
-                buf = await _pi_ws_stream(sid, user_text, aid)
-                assistant.content, assistant.status = buf, "completed"
-                await db.commit()
-                await publish(sid, "message.end", {"msg_id": aid, "finish_reason": "stop"})
-                return
-            except Exception:  # noqa: BLE001
-                # WS 不可达/出错 → 回落本地假流式（绝不让请求悬挂）
-                buf = ""
+            orch = Orchestrator(db)
+            intent = orch._route(user_text)
+            if intent == "chat":
+                try:
+                    buf = await _pi_ws_stream(sid, user_text, aid)
+                    assistant.content, assistant.status = buf, "completed"
+                    await db.commit()
+                    await publish(sid, "message.end", {"msg_id": aid, "finish_reason": "stop"})
+                    return
+                except Exception:  # noqa: BLE001
+                    buf = ""  # WS 失败 → 回落假流式
+            # 文档生成类：落到下方 Orchestrator.handle（薄监督器，含落库）
 
         try:
             async for delta in Orchestrator(db).handle(sid, user_text, hitl_mode):

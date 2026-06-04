@@ -24,6 +24,19 @@ function readProject(p: string): string {
   }
 }
 
+/** 命令 → prompt 模板展开（/ord /crd /prd 读 .pi/prompts/<kind>.md 拼上游输入）。 */
+const PROMPT_KINDS = new Set(["ord", "crd", "prd", "selfcheck", "structure"]);
+function expandCommand(content: string): string {
+  const m = content.match(/^\/(\w+)\s*([\s\S]*)$/);
+  if (!m) return content;
+  const kind = m[1].toLowerCase();
+  const rest = m[2] ?? "";
+  if (!PROMPT_KINDS.has(kind)) return content;
+  const tpl = readProject(`.pi/prompts/${kind}.md`);
+  if (!tpl) return content; // 无模板则原样（structure 等 Phase 5 再补）
+  return `${tpl}\n${rest}`;
+}
+
 /** WS 事件（对齐前端/后端 7 事件语义子集）。 */
 export type WsEvent =
   | { type: "message.delta"; text: string }
@@ -165,16 +178,16 @@ export class AgentSession {
   /** 需求生成：跑一轮，返回 markdown 文本。 */
   async runRequirement(kind: string, upstream: string): Promise<string> {
     this.lastText = "";
-    await this.agent.prompt(`/${kind}\n${upstream}`);
+    await this.agent.prompt(expandCommand(`/${kind}\n${upstream}`));
     await this.agent.waitForIdle();
     this.assertNoError();
     if (!this.lastText.trim()) throw new Error("agent produced empty requirement");
     return this.lastText;
   }
 
-  /** 普通消息（WS 路径用，不等待，事件实时推）。 */
+  /** 普通消息（WS 路径用，不等待，事件实时推）。命令自动展开模板。 */
   post(content: string): void {
-    void this.agent.prompt(content);
+    void this.agent.prompt(expandCommand(content));
   }
 
   setStructured(s: Record<string, unknown>): void {
