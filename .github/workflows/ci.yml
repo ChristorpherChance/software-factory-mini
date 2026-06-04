@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:   # pi 冒烟手动触发（需 Secrets.LLM_API_KEY）
+
+jobs:
+  # 回归底线：LLM_PROVIDER=stub 离线契约/单测（无外网、无 Key）
+  backend-stub:
+    runs-on: ubuntu-latest
+    env:
+      LLM_PROVIDER: stub
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          cd backend
+          python -m pip install -U pip
+          pip install -r requirements.txt
+      - name: POC-1 / 集成 / E2E（stub 严判）
+        run: |
+          cd backend
+          python -X utf8 -m tests.poc1_material_parse
+          python -X utf8 -m pytest tests/test_integration.py -q
+          python -X utf8 -m tests.smoke_e2e
+
+  # agent-service：编译 + pathGuard 单测（不需 Key）
+  agent-service:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build + 单测
+        run: |
+          cd agent-service
+          npm install
+          npm run build
+          npx tsx --test src/hooks/pathGuard.test.ts
+
+  # pi 路径冒烟：仅手动触发，需 Secrets.LLM_API_KEY（DeepSeek）
+  pi-smoke:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: 起 agent-service
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: deepseek-v4-pro
+          LLM_BASE_URL: https://api.deepseek.com
+        run: |
+          cd agent-service && npm install && npm run build
+          node dist/server.js &
+          for i in $(seq 1 15); do curl -sf localhost:9100/v1/health && break; sleep 1; done
+      - name: pi 真实路径冒烟（资料→ORD）
+        env:
+          LLM_PROVIDER: pi
+          PI_BASE: http://localhost:9100/v1
+          PI_WS_BASE: ws://localhost:9100/v1
+        run: |
+          cd backend && pip install -r requirements.txt
+          python -X utf8 -c "import asyncio; from app.core import llm; print(asyncio.run(llm.generate_requirement('ord','R-001 chat'))[:120])"
