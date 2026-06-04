@@ -1,0 +1,24 @@
+# 核心运行依赖（本地 stub 模式即可跑通全部 M1-M3 / M-SET 与 POC）
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+pydantic-settings>=2.2
+sqlalchemy[asyncio]>=2.0
+aiosqlite>=0.19
+httpx>=0.27
+cryptography>=42.0
+pyyaml>=6.0
+python-multipart>=0.0.9
+
+# 测试
+pytest>=8.0
+pytest-asyncio>=0.23
+
+# 可选增强（按需取消注释）
+# asyncpg>=0.29           # 云端 Postgres
+# redis>=5.0              # 云端 Redis 事件总线
+# pdfminer.six>=20240706  # PDF 抽取
+# python-docx>=1.1        # Word 抽取
+# readability-lxml>=0.8   # 网页正文抽取
+# anthropic>=0.25         # 真实 LLM
+# paddleocr>=2.7          # 图片 OCR

@@ -1,0 +1,118 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Design tokens — sourced from the .pen file variables.
+ * Raw hex kept as reference in comments; CSS uses the same hex so Tailwind
+ * `theme.colors` can reference them via var(--token).
+ */
+@layer base {
+  :root {
+    /* brand */
+    --primary: #2563eb;
+    --primary-hover: #1d4ed8;
+    --primary-subtle: #eff6ff;
+
+    /* neutral · text */
+    --text: #0f172a;
+    --text-secondary: #475569;
+    --text-muted: #94a3b8;
+
+    /* neutral · surfaces */
+    --bg: #ffffff;
+    --bg-subtle: #f8fafc;
+    --bg-elevated: #ffffff;
+    --border: #e2e8f0;
+
+    /* semantic */
+    --success: #16a34a;
+    --success-subtle: #f0fdf4;
+    --warning: #d97706;
+    --warning-subtle: #fffbeb;
+    --error: #dc2626;
+    --error-subtle: #fef2f2;
+    --info: #0ea5e9;
+
+    /* diff / pending */
+    --diff-add: #16a34a;
+    --diff-del: #dc2626;
+    --diff-mod: #d97706;
+    --pending: #eab308;
+
+    /* radii */
+    --radius-sm: 6px;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+    --radius: 8px;
+
+    /* shadcn semantic aliases (mapped onto our tokens) */
+    --background: var(--bg);
+    --foreground: var(--text);
+    --card: var(--bg-elevated);
+    --card-foreground: var(--text);
+    --popover: var(--bg-elevated);
+    --popover-foreground: var(--text);
+    --muted: var(--bg-subtle);
+    --muted-foreground: var(--text-secondary);
+    --accent: var(--primary-subtle);
+    --accent-foreground: var(--primary);
+    --input: var(--border);
+    --ring: var(--primary);
+  }
+
+  .dark {
+    --primary: #2563eb;
+    --primary-hover: #1d4ed8;
+    --primary-subtle: #1e293b;
+
+    --text: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+
+    --bg: #0f172a;
+    --bg-subtle: #1e293b;
+    --bg-elevated: #1e293b;
+    --border: #334155;
+
+    --success: #16a34a;
+    --success-subtle: #14271b;
+    --warning: #d97706;
+    --warning-subtle: #2a2010;
+    --error: #dc2626;
+    --error-subtle: #2a1414;
+    --info: #0ea5e9;
+
+    --diff-add: #16a34a;
+    --diff-del: #dc2626;
+    --diff-mod: #d97706;
+    --pending: #eab308;
+  }
+
+  * {
+    border-color: var(--border);
+  }
+
+  body {
+    background-color: var(--bg);
+    color: var(--text);
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  /* slim scrollbars matching the prototype */
+  .sf-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: var(--text-muted) transparent;
+  }
+  .sf-scroll::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .sf-scroll::-webkit-scrollbar-thumb {
+    background: var(--text-muted);
+    border-radius: 999px;
+  }
+  .sf-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}

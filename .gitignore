@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.db
+*.db-wal
+*.db-shm
+tests/_pytest.db*
+data/
+
+# Node / Next
+node_modules/
+.next/
+.env.local
+
+# 环境
+.env
+
+# 工具临时
+*.log
+.pytest_cache/
