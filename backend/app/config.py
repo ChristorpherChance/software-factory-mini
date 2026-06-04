@@ -31,13 +31,16 @@ class Settings(BaseSettings):
     secrets_master_key: str = "base64:c2ZtaW5pLWRldi1tYXN0ZXIta2V5LTMyYnl0ZXMhISE="
 
     # ---- LLM Provider ----
-    # stub（默认，离线确定性）| anthropic
+    # stub（默认，离线确定性）| anthropic | pi（内嵌 pi-agent-core 的 agent-service）
+    # 默认保持 stub：本地零依赖 + CI 回归底线。需 Pi 时显式设 LLM_PROVIDER=pi。
     llm_provider: str = "stub"
     llm_api_key: str = ""
     llm_model: str = "claude-3-5-sonnet-20241022"
 
-    # ---- 委派 Pi 子会话基址（方案 C 接口骨架，本期可选）----
+    # ---- Pi agent-service 基址（Phase 1+ pi provider 用）----
+    # 本地默认 localhost；云端 docker-compose 覆盖为 http://agent-service:9100/v1
     pi_base: str = "http://localhost:9100/v1"
+    pi_ws_base: str = "ws://localhost:9100/v1"
 
 
 settings = Settings()

@@ -141,12 +141,23 @@ export class AgentSession {
     }
   }
 
+  /** 跑完后若 Agent 处于错误态，抛出（让 server 返回非 2xx → Python 侧回落 stub，铁律#3）。 */
+  private assertNoError(): void {
+    const errMsg = this.agent.state.errorMessage;
+    if (errMsg) throw new Error(`agent error: ${errMsg}`);
+  }
+
   /** 资料结构化：跑一轮，返回结构化 JSON（Phase 3 由 emit 工具回填 lastStructured）。 */
   async runStructure(text: string): Promise<Record<string, unknown>> {
     this.lastText = "";
     this.lastStructured = null;
     await this.agent.prompt(`/structure\n${text}`);
     await this.agent.waitForIdle();
+    this.assertNoError();
+    // 无结构化输出且无文本视为失败（避免空结果伪装成功）
+    if (!this.lastStructured && !this.lastText.trim()) {
+      throw new Error("agent produced empty structure");
+    }
     return this.lastStructured ?? { _raw: this.lastText };
   }
 
@@ -155,6 +166,8 @@ export class AgentSession {
     this.lastText = "";
     await this.agent.prompt(`/${kind}\n${upstream}`);
     await this.agent.waitForIdle();
+    this.assertNoError();
+    if (!this.lastText.trim()) throw new Error("agent produced empty requirement");
     return this.lastText;
   }
 

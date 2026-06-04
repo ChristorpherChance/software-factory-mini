@@ -308,15 +308,58 @@ async def _anthropic_requirement(kind: str, upstream: str, session_id: str | Non
 
 
 # ---------------------------------------------------------------------------
+# pi provider（内嵌 pi-agent-core 的 agent-service，HTTP 调用）
+# 铁律#3：任何异常都回落 _stub_*，绝不让请求 500。
+# ---------------------------------------------------------------------------
+_PI_TIMEOUT = 120
+
+
+async def _pi_structure(text: str) -> dict:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=_PI_TIMEOUT) as c:
+        r = await c.post(
+            f"{settings.pi_base}/structure",
+            json={"text": text, "session_id": None},
+            headers={"Authorization": f"Bearer {settings.auth_bearer_token}"},
+        )
+        r.raise_for_status()
+        return r.json()["data"]
+
+
+async def _pi_requirement(kind: str, upstream: str) -> str:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=_PI_TIMEOUT) as c:
+        r = await c.post(
+            f"{settings.pi_base}/requirement",
+            json={"kind": kind, "upstream": upstream, "session_id": None},
+            headers={"Authorization": f"Bearer {settings.auth_bearer_token}"},
+        )
+        r.raise_for_status()
+        return r.json()["data"]["markdown"]
+
+
+# ---------------------------------------------------------------------------
 # 统一入口
 # ---------------------------------------------------------------------------
 async def structure_material(text: str, session_id: str | None = None) -> dict:
+    if settings.llm_provider == "pi":
+        try:
+            return await _pi_structure(text)
+        except Exception:
+            return _stub_structure(text)  # 离线兜底（铁律#3）
     if settings.llm_provider == "anthropic" and settings.llm_api_key:
         return await _anthropic_structure(text, session_id=session_id)
     return _stub_structure(text)
 
 
 async def generate_requirement(kind: str, upstream: str, session_id: str | None = None) -> str:
+    if settings.llm_provider == "pi":
+        try:
+            return await _pi_requirement(kind, upstream)
+        except Exception:
+            return _stub_requirement(kind, upstream)  # 离线兜底（铁律#3）
     if settings.llm_provider == "anthropic" and settings.llm_api_key:
         return await _anthropic_requirement(kind, upstream, session_id=session_id)
     return _stub_requirement(kind, upstream)

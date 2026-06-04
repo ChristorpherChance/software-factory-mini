@@ -25,6 +25,13 @@ app.addHook("onRequest", async (req, reply) => {
   }
 });
 
+// 统一错误 envelope（含 Agent 失败 → 502，便于 Python 侧 raise_for_status 回落 stub）
+app.setErrorHandler((error, req, reply) => {
+  const code = (error as any).statusCode && (error as any).statusCode < 500 ? (error as any).statusCode : 502;
+  req.log.error(error);
+  reply.code(code).send(errEnv("AGENT_ERROR", error.message ?? "agent failure", String(req.id)));
+});
+
 const manager = new AgentManager();
 
 app.get("/v1/health", async () => ok({ status: "ok" }));
