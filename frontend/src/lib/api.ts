@@ -467,4 +467,52 @@ export const api = {
     ),
   settingAudit: (pid: string) =>
     req<SettingAuditDto[]>(`/projects/${pid}/setting-audit`),
+
+  // --- 能力库（Phase 3.5 能力进化双环） ---
+  capabilities: () => req<CapabilityDto[]>(`/internal/capability/list`),
+  capabilityVersions: (aid: string) =>
+    req<CapabilityVersionDto[]>(`/internal/capability/${aid}/versions`),
+  proposeCapability: (b: {
+    name: string;
+    kind: "skill" | "prompt" | "agent_md";
+    draft: string;
+    rationale: string;
+  }) =>
+    req<{ version_id: string; pending_change_id: string; artifact_id: string }>(
+      `/internal/capability/propose`,
+      { method: "POST", body: JSON.stringify(b) }
+    ),
+  approveCapability: (pendingChangeId: string) =>
+    req<{ approved: boolean }>(`/internal/capability/approve`, {
+      method: "POST",
+      body: JSON.stringify({ pending_change_id: pendingChangeId }),
+    }),
+  applyCapability: (versionId: string) =>
+    req<{ kind: string; name: string; content: string; score: number }>(
+      `/internal/capability/apply`,
+      { method: "POST", body: JSON.stringify({ version_id: versionId }) }
+    ),
+  rollbackCapability: (versionId: string) =>
+    req<{ kind: string; name: string; content: string; version: number }>(
+      `/internal/capability/rollback`,
+      { method: "POST", body: JSON.stringify({ version_id: versionId }) }
+    ),
 };
+
+export interface CapabilityDto {
+  id: string;
+  kind: "skill" | "prompt" | "agent_md";
+  name: string;
+  currentVersion: number;
+  latestVersionId?: string | null;
+  content: string;
+  status?: string;
+}
+
+export interface CapabilityVersionDto {
+  versionId: string;
+  version: number;
+  author: string;
+  note?: string | null;
+  content: string;
+}

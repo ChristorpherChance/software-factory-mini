@@ -17,6 +17,7 @@ from . import (
     notifications,
     files,
     internal,
+    capability,
 )
 
 router = APIRouter()
@@ -36,5 +37,6 @@ for _m in (
     notifications,
     files,
     internal,
+    capability,
 ):
     router.include_router(_m.router)

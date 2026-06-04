@@ -8,6 +8,7 @@ import { stageGateCheckTool } from "./stageGate.js";
 import { emitTaskEventTool } from "./emitTaskEvent.js";
 import { delegateTool } from "./delegate.js";
 import { fileWriteTool } from "./fileWrite.js";
+import { skillProposeTool, skillApplyTool } from "./skill.js";
 
 export const allTools: AgentTool<any>[] = [
   parseMaterialTool,
@@ -16,4 +17,6 @@ export const allTools: AgentTool<any>[] = [
   emitTaskEventTool,
   delegateTool,
   fileWriteTool, // 受 pathGuard 约束（Phase 4）
+  skillProposeTool, // 能力提案（不写盘，Phase 3.5）
+  skillApplyTool, // 能力应用（受保护路径唯一写入口，Phase 3.5）
 ];
