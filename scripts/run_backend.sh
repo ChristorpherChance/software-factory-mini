@@ -2,6 +2,13 @@
 # 本地一键起后端（stub 模式，SQLite + 内存事件总线，零外部依赖）。
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# 端口单一配置源（改端口只改 ports.env）
+if [ -f "$ROOT/ports.env" ]; then
+  set -a; . "$ROOT/ports.env"; set +a
+fi
+BACKEND_PORT="${BACKEND_PORT:-8001}"
+
 cd "$ROOT/backend"
 
 # 检测可用的 Python 命令
@@ -33,5 +40,5 @@ if ! "$PY" -c "import fastapi" 2>/dev/null; then
   "$PIP" install -q -r requirements.txt
 fi
 
-echo "[run] 启动后端 http://localhost:8000  (docs: /docs)"
-"$PY" -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+echo "[run] 启动后端 http://localhost:${BACKEND_PORT}  (docs: /docs)"
+"$PY" -m uvicorn app.main:app --host 0.0.0.0 --port "$BACKEND_PORT" --reload

@@ -88,6 +88,6 @@
    （或 `python -c "import compileall,sys; sys.exit(0 if compileall.compile_dir('app',quiet=1) else 1)"`）
 3. 临时验证 venv：`/tmp/sfprobe/Scripts/python.exe`（已装 fastapi/sqlalchemy/aiosqlite/cryptography/redis/pyyaml/pdfminer/python-docx）。
 4. 正式 venv 在 `software-factory-mini/backend/.venv`（Task#6 创建）。
-5. 起后端：`uvicorn app.main:app --port 8000`；健康检查 `GET /api/v1/health`。
-6. 前端：`cd frontend && npm i && npm run dev`（端口 3000）。
+5. 起后端：`uvicorn app.main:app --port 8001`；健康检查 `GET /api/v1/health`（端口集中在根 `ports.env`）。
+6. 前端：`cd frontend && npm i && npm run dev -- -p 3001`（端口 3001，取自 `ports.env`）。
 7. POC：`python -m tests.poc1_material_parse` / `poc2_delegate`。

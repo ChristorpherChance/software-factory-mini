@@ -1,5 +1,5 @@
 // 回调 FastAPI 的统一出口（铁律#4：token 仅内存，不打日志）。
-const BACKEND = process.env.BACKEND_ORIGIN ?? "http://localhost:8000";
+const BACKEND = process.env.BACKEND_ORIGIN ?? "http://localhost:8001";
 const TOKEN = process.env.AUTH_BEARER_TOKEN ?? "dev-single-workspace-token";
 
 export async function callBackend<T = any>(path: string, body: unknown): Promise<T> {

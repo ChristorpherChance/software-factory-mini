@@ -11,6 +11,17 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 OPEN_BROWSER=true
 FORCE=""
 
+# ── 端口单一配置源（改端口只改 ports.env）────────────────
+if [ -f "$ROOT/ports.env" ]; then
+  set -a; . "$ROOT/ports.env"; set +a
+fi
+BACKEND_PORT="${BACKEND_PORT:-8001}"
+FRONTEND_PORT="${FRONTEND_PORT:-3001}"
+AGENT_PORT="${AGENT_PORT:-9100}"
+# 前端访问后端的地址：由 BACKEND_PORT 派生并导出，压过 .env.local 默认值
+export BACKEND_ORIGIN="http://localhost:${BACKEND_PORT}"
+export NEXT_PUBLIC_SSE_BASE="http://localhost:${BACKEND_PORT}/api/v1"
+
 for arg in "$@"; do
   case "$arg" in
     --no-open) OPEN_BROWSER=false ;;
@@ -92,7 +103,7 @@ else
       fi
     done
   }
-  for p in 8001 8000 3000 9100; do
+  for p in "$BACKEND_PORT" "$FRONTEND_PORT" "$AGENT_PORT"; do
     kill_port "$p"
   done
 fi
@@ -139,14 +150,14 @@ if [ "$MODE" = "pi" ]; then
 
     [ -f ".env" ] || cp .env.example .env 2>/dev/null || true
 
-    echo "[Pi] 启动 agent-service → http://localhost:9100"
-    node --env-file=.env dist/server.js &
+    echo "[Pi] 启动 agent-service → http://localhost:${AGENT_PORT}"
+    PORT="$AGENT_PORT" node --env-file=.env dist/server.js &
     AGENT_PID=$!
 
     # 等待就绪
     echo -n "[Pi] 等待 agent-service 就绪"
     for i in $(seq 1 20); do
-      if curl -sf http://localhost:9100/v1/health >/dev/null 2>&1; then
+      if curl -sf "http://localhost:${AGENT_PORT}/v1/health" >/dev/null 2>&1; then
         echo ""
         echo "[√] agent-service 已就绪"
         break
@@ -191,17 +202,17 @@ fi
 
 if [ "$MODE" = "pi" ]; then
   export LLM_PROVIDER=pi
-  export PI_BASE=http://localhost:9100/v1
-  export PI_WS_BASE=ws://localhost:9100/v1
-  echo "[后端] 启动 uvicorn（pi）→ http://localhost:8000"
+  export PI_BASE="http://localhost:${AGENT_PORT}/v1"
+  export PI_WS_BASE="ws://localhost:${AGENT_PORT}/v1"
+  echo "[后端] 启动 uvicorn（pi）→ http://localhost:${BACKEND_PORT}"
 else
   export LLM_PROVIDER=stub
-  echo "[后端] 启动 uvicorn（stub）→ http://localhost:8000"
+  echo "[后端] 启动 uvicorn（stub）→ http://localhost:${BACKEND_PORT}"
 fi
 
 # 不用 --reload：Windows 上 reload 会派生继承监听 socket 的子进程，
 # 导致停止时端口清理不干净。需热重载请改用 scripts/run_backend.sh。
-"$PY" -m uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+"$PY" -m uvicorn app.main:app --host 0.0.0.0 --port "$BACKEND_PORT" &
 BACKEND_PID=$!
 
 # ── 前端 ─────────────────────────────────
@@ -216,15 +227,15 @@ fi
 
 [ -f ".env.local" ] || cp .env.example .env.local 2>/dev/null || true
 
-echo "[前端] 启动 Next.js dev → http://localhost:3000"
-npm run dev &
+echo "[前端] 启动 Next.js dev → http://localhost:${FRONTEND_PORT}"
+npm run dev -- -p "$FRONTEND_PORT" &
 FRONTEND_PID=$!
 
 # ── 等待后端就绪 ─────────────────────────
 echo ""
 echo "[等待] 后端就绪中…"
 for i in $(seq 1 30); do
-  if curl -sf http://localhost:8000/api/v1/health >/dev/null 2>&1; then
+  if curl -sf "http://localhost:${BACKEND_PORT}/api/v1/health" >/dev/null 2>&1; then
     echo "[√] 后端已就绪"
     break
   fi
@@ -234,22 +245,22 @@ done
 
 # ── 打开浏览器 ───────────────────────────
 if $OPEN_BROWSER; then
-  echo "[浏览器] 打开 http://localhost:3000 …"
+  echo "[浏览器] 打开 http://localhost:${FRONTEND_PORT} …"
   sleep 2
   if command -v start >/dev/null 2>&1; then
-    start http://localhost:3000
+    start "http://localhost:${FRONTEND_PORT}"
   elif command -v open >/dev/null 2>&1; then
-    open http://localhost:3000
+    open "http://localhost:${FRONTEND_PORT}"
   elif command -v xdg-open >/dev/null 2>&1; then
-    xdg-open http://localhost:3000
+    xdg-open "http://localhost:${FRONTEND_PORT}"
   fi
 fi
 
 echo ""
 echo "============================================"
-[ "$MODE" = "pi" ] && echo "  Pi      http://localhost:9100/v1/health"
-echo "  后端    http://localhost:8000/docs"
-echo "  前端    http://localhost:3000"
+[ "$MODE" = "pi" ] && echo "  Pi      http://localhost:${AGENT_PORT}/v1/health"
+echo "  后端    http://localhost:${BACKEND_PORT}/docs"
+echo "  前端    http://localhost:${FRONTEND_PORT}"
 echo ""
 echo "  Ctrl+C 停止所有服务（或另开终端跑 bash stop.sh）"
 echo "============================================"

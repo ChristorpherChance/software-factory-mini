@@ -2,7 +2,20 @@
 # 按端口精准杀进程，绝不按进程名误伤其他 node/python。
 # 用 netstat -ano 取端口归属 PID —— 它对 uvicorn --reload 这类
 # 父子共享监听 socket 的情况比 Get-NetTCPConnection 更完整可靠。
-$ports = @(9100, 8001, 8000, 3000)
+# 端口单一配置源：解析仓库根 ports.env（改端口只改那一个文件）
+$envFile = Join-Path $PSScriptRoot "..\ports.env"
+$cfg = @{}
+if (Test-Path $envFile) {
+    foreach ($line in Get-Content $envFile) {
+        if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^#\s]+)') {
+            $cfg[$matches[1]] = $matches[2]
+        }
+    }
+}
+$backendPort  = if ($cfg.BACKEND_PORT)  { [int]$cfg.BACKEND_PORT }  else { 8001 }
+$frontendPort = if ($cfg.FRONTEND_PORT) { [int]$cfg.FRONTEND_PORT } else { 3001 }
+$agentPort    = if ($cfg.AGENT_PORT)    { [int]$cfg.AGENT_PORT }    else { 9100 }
+$ports = @($agentPort, $backendPort, $frontendPort)
 $killed = $false
 
 foreach ($p in $ports) {

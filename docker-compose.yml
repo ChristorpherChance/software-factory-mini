@@ -1,3 +1,5 @@
+# 端口：BACKEND_PORT/FRONTEND_PORT 与本地 ports.env 同名，可在同目录 .env 覆盖
+# （默认 8001/3001）。改这两个值时，nginx/nginx.conf 的 proxy_pass 端口需同步。
 services:
   nginx:
     image: nginx:1.25-alpine
@@ -18,14 +20,14 @@ services:
       PI_WS_BASE: ws://agent-service:9100/v1
     depends_on: [postgres, redis]
     volumes: ["blob:/data/blob"]
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    command: uvicorn app.main:app --host 0.0.0.0 --port ${BACKEND_PORT:-8001}
 
   agent-service:
     build: ./agent-service
     environment:
       PORT: "9100"
       AUTH_BEARER_TOKEN: ${AUTH_BEARER_TOKEN:-dev-single-workspace-token}
-      BACKEND_ORIGIN: http://backend:8000
+      BACKEND_ORIGIN: http://backend:${BACKEND_PORT:-8001}
       # DeepSeek（OpenAI 兼容）。LLM_API_KEY 仅注入内存，不落盘、不进镜像层（铁律#4）
       LLM_MODEL: ${LLM_MODEL:-deepseek-v4-pro}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
@@ -39,7 +41,8 @@ services:
   frontend:
     build: ./frontend
     environment:
-      BACKEND_ORIGIN: http://backend:8000
+      BACKEND_ORIGIN: http://backend:${BACKEND_PORT:-8001}
+      PORT: ${FRONTEND_PORT:-3001}   # next start 读取 PORT 绑定监听端口
     command: npm run start
   postgres:
     image: postgres:14-alpine

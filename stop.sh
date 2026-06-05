@@ -6,7 +6,12 @@
 #       不会误伤其他 node/python 进程）；真正的 macOS/Linux 走 lsof/fuser + kill。
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-PORTS="9100 8001 8000 3000"
+
+# 端口单一配置源（改端口只改 ports.env）
+if [ -f "$ROOT/ports.env" ]; then
+  set -a; . "$ROOT/ports.env"; set +a
+fi
+PORTS="${AGENT_PORT:-9100} ${BACKEND_PORT:-8001} ${FRONTEND_PORT:-3001}"
 
 echo "======================================"
 echo "  Software Factory Mini — 停止所有服务"

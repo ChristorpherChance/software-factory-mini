@@ -21,6 +21,14 @@ if errorlevel 1 (
 set "MODE=stub"
 set "OPEN_BROWSER=true"
 
+REM ==== Ports (single source of truth: ports.env) ====
+set "BACKEND_PORT=8001"
+set "FRONTEND_PORT=3001"
+set "AGENT_PORT=9100"
+if exist "%ROOT%\ports.env" (
+  for /f "usebackq eol=# tokens=1,2 delims==" %%a in ("%ROOT%\ports.env") do set "%%a=%%b"
+)
+
 REM 自动检测: agent-service\.env 中有非空 LLM_API_KEY 则用 pi 模式
 if exist "%ROOT%\agent-service\.env" (
   findstr /R /C:"^LLM_API_KEY=..*" "%ROOT%\agent-service\.env" >nul 2>&1
@@ -69,7 +77,7 @@ for /f "tokens=*" %%V in ('%PYTHON_EXE% --version 2^>nul') do echo [OK] Python: 
 echo.
 
 REM ==== Port Cleanup ====
-echo [Clean] Releasing ports 9100/8001/8000/3000...
+echo [Clean] Releasing ports %AGENT_PORT%/%BACKEND_PORT%/%FRONTEND_PORT%...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\scripts\cleanup_ports.ps1"
 timeout /t 2 /nobreak >nul 2>&1
 echo.
@@ -105,13 +113,13 @@ if not exist ".env" (
   )
 )
 
-echo [Pi] Starting agent-service on port 9100...
-start "SF-Mini Agent" cmd /k "cd /d %ROOT%\agent-service && node --env-file=.env dist\server.js"
+echo [Pi] Starting agent-service on port %AGENT_PORT%...
+start "SF-Mini Agent" cmd /k "cd /d %ROOT%\agent-service && set PORT=%AGENT_PORT%&& set BACKEND_ORIGIN=http://localhost:%BACKEND_PORT%&& node --env-file=.env dist\server.js"
 
 echo [Pi] Waiting for agent-service (max 20s)...
 set /a AGENT_TRIES=0
 :wait_agent
-curl -sf http://localhost:9100/v1/health >nul 2>&1
+curl -sf http://localhost:%AGENT_PORT%/v1/health >nul 2>&1
 if not errorlevel 1 goto agent_ok
 set /a AGENT_TRIES+=1
 if %AGENT_TRIES% geq 20 goto agent_timeout
@@ -162,11 +170,11 @@ if not exist ".env" (
   )
 )
 
-echo [Backend] Starting uvicorn on port 8000...
+echo [Backend] Starting uvicorn on port %BACKEND_PORT%...
 if "%MODE%"=="pi" (
-  start "SF-Mini Backend" cmd /k "cd /d %ROOT%\backend && set LLM_PROVIDER=pi&& set PI_BASE=http://localhost:9100/v1&& set PI_WS_BASE=ws://localhost:9100/v1&& .venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
+  start "SF-Mini Backend" cmd /k "cd /d %ROOT%\backend && set LLM_PROVIDER=pi&& set PI_BASE=http://localhost:%AGENT_PORT%/v1&& set PI_WS_BASE=ws://localhost:%AGENT_PORT%/v1&& .venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port %BACKEND_PORT%"
 ) else (
-  start "SF-Mini Backend" cmd /k "cd /d %ROOT%\backend && set LLM_PROVIDER=stub&& .venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
+  start "SF-Mini Backend" cmd /k "cd /d %ROOT%\backend && set LLM_PROVIDER=stub&& .venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port %BACKEND_PORT%"
 )
 
 REM ==== Frontend ====
@@ -186,8 +194,8 @@ if not exist ".env.local" (
   )
 )
 
-echo [Frontend] Starting Next.js on port 3000...
-start "SF-Mini Frontend" cmd /k "cd /d %ROOT%\frontend && npm run dev"
+echo [Frontend] Starting Next.js on port %FRONTEND_PORT%...
+start "SF-Mini Frontend" cmd /k "cd /d %ROOT%\frontend && set BACKEND_ORIGIN=http://localhost:%BACKEND_PORT%&& set NEXT_PUBLIC_SSE_BASE=http://localhost:%BACKEND_PORT%/api/v1&& npm run dev -- -p %FRONTEND_PORT%"
 
 REM ==== Wait and Open Browser ====
 echo.
@@ -196,7 +204,7 @@ timeout /t 6 /nobreak >nul 2>&1
 
 set /a TRIES=0
 :wait_backend
-curl -sf http://localhost:8000/api/v1/health >nul 2>&1
+curl -sf http://localhost:%BACKEND_PORT%/api/v1/health >nul 2>&1
 if not errorlevel 1 goto backend_ok
 set /a TRIES+=1
 if %TRIES% geq 30 goto backend_timeout
@@ -212,16 +220,16 @@ echo [OK] Backend ready
 
 :maybe_browser
 if "%OPEN_BROWSER%"=="true" (
-  echo [Browser] Opening http://localhost:3000 ...
+  echo [Browser] Opening http://localhost:%FRONTEND_PORT% ...
   timeout /t 3 /nobreak >nul 2>&1
-  start "" http://localhost:3000
+  start "" http://localhost:%FRONTEND_PORT%
 )
 
 echo.
 echo ============================================
-if "%MODE%"=="pi" echo   Pi       http://localhost:9100/v1/health
-echo   Backend  http://localhost:8000/docs
-echo   Frontend http://localhost:3000
+if "%MODE%"=="pi" echo   Pi       http://localhost:%AGENT_PORT%/v1/health
+echo   Backend  http://localhost:%BACKEND_PORT%/docs
+echo   Frontend http://localhost:%FRONTEND_PORT%
 echo.
 echo   Stop:    double-click stop.bat
 echo   Usage:   start.bat [stub^^^|pi] [--no-open]
