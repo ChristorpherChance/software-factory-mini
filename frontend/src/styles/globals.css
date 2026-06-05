@@ -115,4 +115,29 @@
   .sf-scroll::-webkit-scrollbar-track {
     background: transparent;
   }
+
+  /* GFM 表格边框（remark-gfm 渲染的 md 表格；Tailwind prose 默认无边框，复杂表格观感错位） */
+  .prose table {
+    width: 100%;
+    border-collapse: collapse;
+    display: table;
+    overflow-x: auto;
+  }
+  .prose th,
+  .prose td {
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+    text-align: left;
+    vertical-align: top;
+  }
+  .prose thead th {
+    background: var(--bg-subtle);
+    font-weight: 600;
+  }
+  /* 表格横向滚动容器：宽表不撑破主区 */
+  .prose > table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+  }
 }

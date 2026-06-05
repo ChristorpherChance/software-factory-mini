@@ -42,7 +42,13 @@ async def lst(
     db: AsyncSession = Depends(get_db),
     _=Depends(require_auth),
 ):
-    q = select(Project).where(Project.archived_at.is_(None)).order_by(Project.created_at.desc()).limit(limit)
+    # 过滤内部容器项目（能力库/Agent Prompt 等以 "__" 命名，不应出现在用户项目列表）
+    q = (
+        select(Project)
+        .where(Project.archived_at.is_(None), Project.name.notlike("\\_\\_%", escape="\\"))
+        .order_by(Project.created_at.desc())
+        .limit(limit)
+    )
     rows = (await db.execute(q)).scalars().all()
     return paged([_dto(p) for p in rows], limit=limit)
 

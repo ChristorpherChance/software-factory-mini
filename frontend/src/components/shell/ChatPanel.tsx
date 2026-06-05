@@ -18,7 +18,6 @@ import {
   AtSign,
   Brain,
   Bot,
-  Thermometer,
   Archive,
   ArrowDown,
 } from "lucide-react";
@@ -28,11 +27,18 @@ import { useSessionBootstrap } from "@/hooks/useSessionBootstrap";
 import { useSessionStore } from "@/stores/session";
 import { useHitlStore } from "@/stores/hitl";
 import { useSettingStore } from "@/stores/setting";
+import { useToolCallStore } from "@/stores/toolcall";
+import { useEditTargetStore } from "@/stores/editTarget";
 import { MessageStream } from "@/components/chat/MessageStream";
 import { TaskProgress } from "@/components/chat/TaskProgress";
-import { HitlSwitch } from "@/components/chat/HitlSwitch";
-import { InlineSettingBadges } from "@/components/shell/InlineSettingBadges";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+} from "@/components/ui/dropdown-menu";
 
 // 对话区（M4 P1-B）：
 // - ChatHeader: 会话名 pill + 新建/编辑/删除/更多
@@ -54,9 +60,15 @@ export function ChatPanel() {
   const push = useSessionStore((s) => s.push);
   const messages = useSessionStore((s) => s.messages);
   const setSid = useSessionStore((s) => s.setSid);
+  const resetSession = useSessionStore((s) => s.reset);
+  const hydrateMessages = useSessionStore((s) => s.hydrate);
+  const resetToolCalls = useToolCallStore((s) => s.reset);
   const mode = useHitlStore((s) => s.mode);
   const hydrateSetting = useSettingStore((s) => s.hydrate);
   const setChatWidth = useSettingStore((s) => s.setChatWidth);
+  // 当前主区工件（供对话定向编辑定位目标，问题2）
+  const editTargetType = useEditTargetStore((s) => s.targetType);
+  const editTargetId = useEditTargetStore((s) => s.targetArtifactId);
 
   const dragging = useRef(false);
 
@@ -93,9 +105,31 @@ export function ChatPanel() {
       }),
     onSuccess: (s) => {
       qc.invalidateQueries({ queryKey: ["sessions", pid] });
+      resetSession();
+      resetToolCalls();
       setSid(s.id);
     },
   });
+
+  // 切换历史会话：bootstrap 仅依赖 [pid, urlSid]，运行期改 sid 不会重 hydrate，
+  // 故手动 reset + setSid + 拉取并 hydrate 该会话历史消息。
+  const switchSession = useCallback(
+    async (id: string) => {
+      if (!id || id === sid) return;
+      resetSession();
+      resetToolCalls();
+      setSid(id);
+      try {
+        const msgs = await api.messages(id);
+        hydrateMessages(
+          (msgs ?? []).map((m) => ({ id: m.id, role: m.role, content: m.content }))
+        );
+      } catch {
+        /* 后端不可达静默；发送时会提示 */
+      }
+    },
+    [sid, resetSession, resetToolCalls, setSid, hydrateMessages]
+  );
 
   const onMouseDown = useCallback(() => {
     dragging.current = true;
@@ -129,7 +163,11 @@ export function ChatPanel() {
     setSending(true);
     push({ id: `local-${Date.now()}`, role: "user", content });
     try {
-      await api.send(sid, content, mode);
+      // 透传当前主区工件，使后端「对话定向编辑」能定位目标（问题2）
+      await api.send(sid, content, mode, undefined, {
+        targetType: editTargetType,
+        targetArtifactId: editTargetId,
+      });
     } catch {
       push({
         id: `err-${Date.now()}`,
@@ -157,16 +195,47 @@ export function ChatPanel() {
 
       {/* ChatHeader：会话名 pill + 新建/编辑/删除/更多 icon */}
       <div className="flex items-center justify-between gap-2 border-b border-border px-3.5 py-2.5">
-        <button className="flex min-w-0 items-center gap-1.5 rounded-md border border-border bg-bg-subtle px-2.5 py-1.5">
-          <span className="truncate text-[13px] font-semibold text-text">
-            💬 {currentSession?.title ?? "主会话"}
-          </span>
-          <span
-            className={cnConn(conn)}
-            title={conn === "open" ? "已连接" : conn === "reconnecting" ? "重连中" : "未连接"}
-          />
-          <ChevronDown className="h-3 w-3 text-text-muted" />
-        </button>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              className="flex min-w-0 items-center gap-1.5 rounded-md border border-border bg-bg-subtle px-2.5 py-1.5 hover:bg-border/40"
+              title="切换历史会话"
+            >
+              <span className="truncate text-[13px] font-semibold text-text">
+                💬 {currentSession?.title ?? "主会话"}
+              </span>
+              <span
+                className={cnConn(conn)}
+                title={conn === "open" ? "已连接" : conn === "reconnecting" ? "重连中" : "未连接"}
+              />
+              <ChevronDown className="h-3 w-3 text-text-muted" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start" className="max-h-80 w-64 overflow-y-auto">
+            <DropdownMenuLabel>历史会话</DropdownMenuLabel>
+            {(sessions ?? []).length === 0 ? (
+              <p className="px-2 py-1.5 text-xs text-text-muted">暂无会话</p>
+            ) : (
+              (sessions ?? []).map((s) => (
+                <DropdownMenuItem
+                  key={s.id}
+                  onSelect={() => switchSession(s.id)}
+                  className="flex-col items-start gap-0.5"
+                >
+                  <span className="flex w-full items-center gap-1.5">
+                    {s.id === sid && <span className="text-primary">●</span>}
+                    <span className="truncate text-[13px] font-medium text-text">
+                      {s.title ?? "未命名会话"}
+                    </span>
+                  </span>
+                  <span className="text-[10px] text-text-muted">
+                    {s.stage ?? "—"} · {s.status ?? "active"}
+                  </span>
+                </DropdownMenuItem>
+              ))
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
         <div className="flex items-center gap-0.5">
           <button
             className="flex h-7 w-7 items-center justify-center rounded-md text-text-secondary hover:bg-bg-subtle"
@@ -197,16 +266,6 @@ export function ChatPanel() {
         </div>
       </div>
 
-      {/* HITL + 内联徽章（保留 HitlSwitch + InlineSettingBadges 三档） */}
-      <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-1.5">
-        {sid ? (
-          <InlineSettingBadges pid={pid} sid={sid} />
-        ) : (
-          <span className="text-xs text-text-muted">建立会话中…</span>
-        )}
-        <HitlSwitch />
-      </div>
-
       {/* ProgressBar：streaming 才显示，章节/计时/上下文为 C 档静态占位 */}
       {streaming && <ProgressBar />}
 
@@ -217,6 +276,7 @@ export function ChatPanel() {
 
       {/* InputArea：新动态条 + textarea + 6 工具 icon + 发送 */}
       <InputArea
+        pid={pid}
         sid={sid}
         text={text}
         setText={setText}
@@ -257,12 +317,14 @@ function ProgressBar() {
 }
 
 function InputArea({
+  pid,
   sid,
   text,
   setText,
   sending,
   submit,
 }: {
+  pid: string;
   sid: string | null;
   text: string;
   setText: (v: string) => void;
@@ -270,12 +332,10 @@ function InputArea({
   submit: () => void;
 }) {
   const tools = [
-    { Icon: Paperclip,  label: "上传材料（TODO）" },
-    { Icon: AtSign,     label: "@ 引用工件（TODO）" },
-    { Icon: Brain,      label: "思考模式（TODO）" },
-    { Icon: Bot,        label: "选择 Agent（TODO）" },
-    { Icon: Thermometer,label: "温度（TODO）" },
-    { Icon: Archive,    label: "归档（TODO）" },
+    { Icon: Paperclip, label: "上传材料（TODO）" },
+    { Icon: AtSign,    label: "@ 引用工件（TODO）" },
+    { Icon: Brain,     label: "思考模式（TODO）" },
+    { Icon: Archive,   label: "归档（TODO）" },
   ];
 
   return (
@@ -300,7 +360,7 @@ function InputArea({
           placeholder={sid ? "输入消息，或 @ 引用工件 / 📎 上传材料…" : "建立会话中…"}
           className="sf-scroll w-full resize-none bg-transparent text-[13px] leading-relaxed text-text outline-none placeholder:text-text-muted"
         />
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-0.5">
             {tools.map(({ Icon, label }, i) => (
               <button
@@ -312,17 +372,79 @@ function InputArea({
               </button>
             ))}
           </div>
-          <Button
-            variant="primary"
-            size="sm"
-            onClick={submit}
-            disabled={!sid || !text.trim() || sending}
-          >
-            <Send className="h-3.5 w-3.5" /> 发送
-          </Button>
+          <div className="flex items-center gap-1.5">
+            {/* 模型选择（移到发送按钮左边） */}
+            <ModelPicker pid={pid} sid={sid} />
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={submit}
+              disabled={!sid || !text.trim() || sending}
+            >
+              <Send className="h-3.5 w-3.5" /> 发送
+            </Button>
+          </div>
         </div>
       </div>
     </div>
+  );
+}
+
+/** 模型选择器：列出项目 LLM 端点，选中写会话级覆盖（model.name）。 */
+function ModelPicker({ pid, sid }: { pid: string; sid: string | null }) {
+  const qc = useQueryClient();
+  const model = useSettingStore((s) => s.model);
+  const { data: endpoints } = useQuery({
+    queryKey: ["endpoints", pid],
+    queryFn: () => api.endpoints(pid),
+    enabled: !!pid,
+  });
+  const llm = (endpoints ?? []).filter((e) => e.kind === "llm" && e.enabled);
+  const pick = useMutation({
+    mutationFn: (name: string) => api.putOverride(pid, sid!, "model", "name", name),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["settings", pid] }),
+  });
+  const current = model?.name ?? "默认";
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          disabled={!sid}
+          className="flex items-center gap-1 rounded-md border border-border bg-bg-subtle px-2 py-1 text-xs text-text-secondary hover:bg-border/40 disabled:opacity-50"
+          title="选择模型"
+        >
+          <Bot className="h-3.5 w-3.5" />
+          <span className="max-w-[120px] truncate">{current}</span>
+          <ChevronDown className="h-3 w-3 text-text-muted" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="max-h-72 w-56 overflow-y-auto">
+        <DropdownMenuLabel>模型 / 端点</DropdownMenuLabel>
+        {llm.length === 0 ? (
+          <p className="px-2 py-1.5 text-xs text-text-muted">
+            无可用 LLM 端点，可在设置页添加
+          </p>
+        ) : (
+          llm.map((e) => {
+            const name = e.model ?? e.name;
+            return (
+              <DropdownMenuItem
+                key={e.id}
+                onSelect={() => sid && pick.mutate(name)}
+                className="flex-col items-start gap-0.5"
+              >
+                <span className="flex w-full items-center gap-1.5">
+                  {model?.name === name && <span className="text-primary">●</span>}
+                  <span className="truncate text-[13px] text-text">{name}</span>
+                </span>
+                <span className="text-[10px] text-text-muted">{e.name}</span>
+              </DropdownMenuItem>
+            );
+          })
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 

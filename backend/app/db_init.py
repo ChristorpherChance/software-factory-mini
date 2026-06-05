@@ -39,3 +39,10 @@ async def init_db() -> None:
                 if "no such table" in msg:
                     continue
                 raise
+
+    # 各阶段 Agent Prompt 系统默认种子（幂等；新表 create_all 已建好）
+    from .db import SessionLocal
+    from .services.prompt_seed import seed_prompts
+
+    async with SessionLocal() as s:
+        await seed_prompts(s)

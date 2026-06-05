@@ -21,14 +21,30 @@ export class AgentManager {
     this.sessions.set(sessionId, buildAgent(sessionId));
   }
 
-  async runStructure(text: string, sessionId?: string): Promise<Record<string, unknown>> {
-    return this.ensureSession(this.ensure(sessionId)).runStructure(text);
+  async runStructure(
+    text: string,
+    sessionId?: string,
+    promptOverride?: string,
+  ): Promise<Record<string, unknown>> {
+    return this.ensureSession(this.ensure(sessionId)).runStructure(text, promptOverride);
   }
-  async runRequirement(kind: string, upstream: string, sessionId?: string): Promise<string> {
-    return this.ensureSession(this.ensure(sessionId)).runRequirement(kind, upstream);
+  async runRequirement(
+    kind: string,
+    upstream: string,
+    sessionId?: string,
+    promptOverride?: string,
+  ): Promise<string> {
+    return this.ensureSession(this.ensure(sessionId)).runRequirement(
+      kind,
+      upstream,
+      promptOverride,
+    );
   }
   postMessage(id: string, content: string): void {
     this.ensureSession(id).post(content);
+  }
+  async runBeautify(draft: string, sessionId?: string): Promise<string> {
+    return this.ensureSession(this.ensure(sessionId)).runBeautify(draft);
   }
   resolveHitl(id: string, decision: { reqId: string; decision: "allow" | "rewrite" | "deny" }): void {
     this.ensureSession(id).resolveHitl(decision);

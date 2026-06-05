@@ -68,44 +68,35 @@ fi
 
 echo ""
 
-# ── 端口冲突检测 ──────────────────────────
-check_port() {
-  local port=$1
-  local name=$2
-  if command -v lsof >/dev/null 2>&1; then
-    lsof -ti :$port >/dev/null 2>&1 && return 0 || return 1
-  elif command -v netstat >/dev/null 2>&1; then
-    netstat -ano 2>/dev/null | grep -q ":$port " && return 0 || return 1
-  elif command -v ss >/dev/null 2>&1; then
-    ss -tlnp 2>/dev/null | grep -q ":$port " && return 0 || return 1
-  fi
-  return 1
-}
-
-PORT_CONFLICT=0
-for p in 8000 3000 9100; do
-  case $p in
-    8000) pname="backend" ;;
-    3000) pname="frontend" ;;
-    9100) pname="agent-service" ;;
-  esac
-  if check_port $p "$pname"; then
-    echo "  [!] 端口 $p ($pname) 已被占用 — 请先运行 bash stop.sh"
-    PORT_CONFLICT=1
-  fi
-done
-
-if [ $PORT_CONFLICT -eq 1 ]; then
-  echo ""
-  echo "[提示] 有端口被占用。是否继续？(y/n)"
-  read -r answer
-  if [ "$answer" != "y" ] && [ "$answer" != "Y" ]; then
-    echo "已取消。请先运行: bash stop.sh"
-    exit 0
-  fi
-  echo "继续启动（端口冲突可能导致部分服务失败）…"
-  echo ""
+# ── 端口冲突检测 + 自动清理 ──────────────
+# 策略：Windows(Git Bash) 复用 PowerShell 的 cleanup_ports.ps1（按端口精准杀，
+#       不会误伤其他 node/python 进程）；macOS/Linux 走 lsof + kill。
+echo "[清理] 检查并释放已有端口…"
+if command -v powershell >/dev/null 2>&1 && [ -f "$ROOT/scripts/cleanup_ports.ps1" ]; then
+  powershell -NoProfile -ExecutionPolicy Bypass -File "$ROOT/scripts/cleanup_ports.ps1"
+else
+  kill_port() {
+    local port=$1
+    local pids=""
+    if command -v lsof >/dev/null 2>&1; then
+      pids=$(lsof -ti :"$port" 2>/dev/null)
+    elif command -v fuser >/dev/null 2>&1; then
+      pids=$(fuser "${port}/tcp" 2>/dev/null)
+    fi
+    for pid in $pids; do
+      if kill -0 "$pid" 2>/dev/null; then
+        echo "  [清理] 终止 PID $pid (端口 $port)…"
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+    done
+  }
+  for p in 8001 8000 3000 9100; do
+    kill_port "$p"
+  done
 fi
+echo ""
 
 # ── 模式自动检测 ─────────────────────────
 MODE="stub"
@@ -208,7 +199,9 @@ else
   echo "[后端] 启动 uvicorn（stub）→ http://localhost:8000"
 fi
 
-"$PY" -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload &
+# 不用 --reload：Windows 上 reload 会派生继承监听 socket 的子进程，
+# 导致停止时端口清理不干净。需热重载请改用 scripts/run_backend.sh。
+"$PY" -m uvicorn app.main:app --host 0.0.0.0 --port 8000 &
 BACKEND_PID=$!
 
 # ── 前端 ─────────────────────────────────

@@ -39,6 +39,8 @@ async def parse_material(source: str, session_id: str | None = None) -> dict:
     ) = score_readiness(structured)
     structured["rule_version"] = "v0.1"
     structured["source_kind"] = kind
+    # 保留抽取出的正文，供前端主内容区「完美渲染 + 可编辑」（封顶 200k 防超大文档撑爆）
+    structured["raw_text"] = text[:200_000]
     if session_id:
         await publish(
             session_id,

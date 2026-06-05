@@ -8,7 +8,7 @@ import { cn } from "@/lib/utils";
 // DiffBlockView：照搬原型 KIND_STYLE（add/del/mod 三态）+ 逐块 ✓/✗ + resolved 半透明
 // 调 api.resolveBlock；成功后 invalidate ["pending-changes"] / ["artifact"]（三处同步）。
 
-const KIND_STYLE: Record<
+export const KIND_STYLE: Record<
   DiffBlockDto["kind"],
   { wrap: string; tag: string; text: string; prefix: string; strike?: boolean }
 > = {

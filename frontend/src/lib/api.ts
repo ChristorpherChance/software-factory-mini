@@ -9,6 +9,14 @@ const TOKEN = process.env.NEXT_PUBLIC_TOKEN ?? "dev-single-workspace-token";
 /** 暴露 base，供 SSE EventSource 直接拼地址使用。 */
 export const API_BASE = BASE;
 
+/**
+ * SSE 专用基址：必须绕过 Next.js dev 的 rewrites 代理，因其会缓冲
+ * text/event-stream，导致 EventSource 收不到实时事件（流式输出/生成内容看不到）。
+ * 默认直连后端 8000；可用 NEXT_PUBLIC_SSE_BASE 覆盖（生产同源时设为 /api/v1）。
+ */
+export const SSE_BASE =
+  process.env.NEXT_PUBLIC_SSE_BASE ?? "http://localhost:8000/api/v1";
+
 /** 统一请求：注入鉴权头与 JSON 头，非 2xx 抛错并带回 body。 */
 async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
@@ -95,6 +103,10 @@ export interface MaterialDto {
   type?: string;
   title: string;
   status?: string; // draft | finalized（20260603：文件解析定稿态）
+  /** 是否已完成「内容解析」（transform）。后端 transform 成功时置 true；旧数据为 undefined。 */
+  contentParsed?: boolean;
+  /** 解析抽取出的文档正文（供主内容区渲染 + 编辑）。 */
+  rawText?: string;
   readinessScore: number;
   summary?: string;
   keyPoints?: string[];
@@ -259,6 +271,20 @@ export const api = {
   createProject: (b: { name: string; description?: string }) =>
     req<Project>("/projects", { method: "POST", body: JSON.stringify(b) }),
   project: (pid: string) => req<Project>(`/projects/${pid}`),
+  /** 编辑项目基础信息（乐观锁 If-Match=当前 version）。 */
+  updateProject: (
+    pid: string,
+    b: { name?: string; description?: string },
+    version: number
+  ) =>
+    req<Project>(`/projects/${pid}`, {
+      method: "PATCH",
+      headers: { "If-Match": String(version) },
+      body: JSON.stringify(b),
+    }),
+  /** 删除项目（后端归档，列表自动隐藏）。 */
+  deleteProject: (pid: string) =>
+    req<{ archived: boolean }>(`/projects/${pid}`, { method: "DELETE" }),
 
   // --- 会话 ---
   sessions: (pid: string) => req<SessionDto[]>(`/projects/${pid}/sessions`),
@@ -273,29 +299,63 @@ export const api = {
 
   // --- 消息 ---
   messages: (sid: string) => req<MessageDto[]>(`/sessions/${sid}/messages`),
-  send: (sid: string, content: string, hitlMode: string) =>
+  send: (
+    sid: string,
+    content: string,
+    hitlMode: string,
+    references?: string[],
+    target?: { targetType?: string | null; targetArtifactId?: string | null }
+  ) =>
     req<MessageDto>(`/sessions/${sid}/messages`, {
       method: "POST",
       headers: { "Idempotency-Key": idemKey() },
-      body: JSON.stringify({ role: "user", content, hitlMode }),
+      body: JSON.stringify({
+        role: "user",
+        content,
+        hitlMode,
+        ...(references && references.length ? { references } : {}),
+        ...(target?.targetType ? { targetType: target.targetType } : {}),
+        ...(target?.targetArtifactId ? { targetArtifactId: target.targetArtifactId } : {}),
+      }),
     }),
 
   // --- 资料 ---
   parseMaterial: (
     pid: string,
-    b: { source?: string; isText?: boolean; title?: string; file_id?: string }
+    b: {
+      source?: string;
+      isText?: boolean;
+      title?: string;
+      file_id?: string;
+      asReference?: boolean;
+      scope?: string;
+    }
   ) =>
     req<MaterialDto>(`/projects/${pid}/materials`, {
       method: "POST",
       body: JSON.stringify(b),
     }),
-  materials: (pid: string) => req<MaterialDto[]>(`/projects/${pid}/materials`),
+  materials: (pid: string, scope?: string) =>
+    req<MaterialDto[]>(
+      `/projects/${pid}/materials${scope ? `?scope=${encodeURIComponent(scope)}` : ""}`
+    ),
   /** 文件解析定稿（status → finalized）。 */
   finalizeMaterial: (pid: string, mid: string) =>
     req<{ id: string; status: string }>(
       `/projects/${pid}/materials/${mid}/finalize`,
       { method: "POST" }
     ),
+  /** 内容解析定稿（content_parsed → true，与文件解析定稿独立）。 */
+  finalizeContentMaterial: (pid: string, mid: string) =>
+    req<{ id: string; contentParsed: boolean }>(
+      `/projects/${pid}/materials/${mid}/finalize-content`,
+      { method: "POST" }
+    ),
+  /** 删除已解析资料（连同原上传文件 + 物理文件）。 */
+  deleteMaterial: (pid: string, mid: string) =>
+    req<{ deleted: boolean }>(`/projects/${pid}/materials/${mid}`, {
+      method: "DELETE",
+    }),
   /** 内容解析（翻译/索引/脱敏/知识库增强）。 */
   transformMaterial: (
     pid: string,
@@ -354,6 +414,14 @@ export const api = {
       `/projects/${pid}/artifacts/${aid}/submit-version`,
       { method: "POST", body: JSON.stringify({ content, note }) }
     ),
+  /** 版本列表（无 content，正序；前端按需 reverse）。 */
+  artifactVersions: (aid: string) =>
+    req<Array<{ version: number; author?: string; note?: string | null; createdAt?: string }>>(
+      `/artifacts/${aid}/versions`
+    ),
+  /** 指定版本内容。 */
+  artifactVersion: (aid: string, v: number) =>
+    req<{ version: number; content: string }>(`/artifacts/${aid}/versions/${v}`),
 
   // --- Task ---
   tasks: (pid: string) => req<TaskDto[]>(`/projects/${pid}/tasks`),
@@ -497,7 +565,62 @@ export const api = {
       `/internal/capability/rollback`,
       { method: "POST", body: JSON.stringify({ version_id: versionId }) }
     ),
+
+  // --- 各阶段 Agent Prompt 多版本配置 ---
+  agentPrompts: (pid: string) =>
+    req<AgentPromptSlotDto[]>(`/projects/${pid}/agent-prompts`),
+  agentPromptVersion: (pid: string, slot: string, v: number) =>
+    req<{ version: number; name: string; content: string; readonly: boolean }>(
+      `/projects/${pid}/agent-prompts/${slot}/versions/${v}`
+    ),
+  createAgentPromptVersion: (
+    pid: string,
+    slot: string,
+    b: { content: string; name: string }
+  ) =>
+    req<{ version: number; name: string }>(
+      `/projects/${pid}/agent-prompts/${slot}/versions`,
+      { method: "POST", body: JSON.stringify(b) }
+    ),
+  renameAgentPromptVersion: (pid: string, slot: string, v: number, name: string) =>
+    req<{ version: number; name: string }>(
+      `/projects/${pid}/agent-prompts/${slot}/versions/${v}`,
+      { method: "PATCH", body: JSON.stringify({ name }) }
+    ),
+  /** 美化提示词（调大模型/agent 把草稿整理为规范提示词，返回整理后内容）。 */
+  beautifyAgentPrompt: (pid: string, slot: string, content: string) =>
+    req<{ content: string }>(
+      `/projects/${pid}/agent-prompts/${slot}/beautify`,
+      { method: "POST", body: JSON.stringify({ content }) }
+    ),
+  setAgentPromptCurrent: (pid: string, slot: string, version: number) =>
+    req<{ slot: string; currentVersion: number }>(
+      `/projects/${pid}/agent-prompts/${slot}/current`,
+      { method: "PUT", body: JSON.stringify({ version }) }
+    ),
+  deleteAgentPromptVersion: (pid: string, slot: string, v: number) =>
+    req<{ deleted: boolean; currentVersion: number }>(
+      `/projects/${pid}/agent-prompts/${slot}/versions/${v}`,
+      { method: "DELETE" }
+    ),
 };
+
+export interface AgentPromptVersionMeta {
+  version: number;
+  name: string;
+  author?: string;
+  readonly: boolean;
+  createdAt?: string | null;
+}
+
+export interface AgentPromptSlotDto {
+  slot: string;
+  title: string;
+  artifactId: string;
+  currentVersion: number;
+  defaultContent: string;
+  versions: AgentPromptVersionMeta[];
+}
 
 export interface CapabilityDto {
   id: string;

@@ -14,10 +14,13 @@ import difflib
 import json
 import re
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...models.entities import Session, Artifact, ArtifactVersion, PendingChange
 from ...core.events import publish
+from ...core.prompt_ctx import set_active_prompts
+from ...services.prompt_resolve import load_active_prompts
 from ..material.pipeline import parse_material
 from ..requirement.generator import generate, extract_nodes
 
@@ -127,9 +130,20 @@ class Orchestrator:
         hitl = (s.hitl_mode if s and s.hitl_mode else None) or "Semi"
         return pid, hitl, s
 
-    async def handle(self, session_id: str, user_text: str, hitl_mode: str | None = None):
+    async def handle(
+        self,
+        session_id: str,
+        user_text: str,
+        hitl_mode: str | None = None,
+        references: list[str] | None = None,
+    ):
         pid, sess_hitl, _ = await self._project_and_hitl(session_id)
         hitl = hitl_mode or sess_hitl
+        # 注入各 Agent 当前绑定 Prompt（设置页配置）；仅 anthropic/pi 生效，stub 忽略
+        try:
+            set_active_prompts(await load_active_prompts(self.db))
+        except Exception:
+            pass
         intent = self._route(user_text)
 
         if intent == "parse_material":
@@ -144,7 +158,11 @@ class Orchestrator:
 
         if intent in ("ord", "crd", "prd"):
             yield f"生成 {intent.upper()} 中…\n"
-            upstream_md = await self._upstream_md(pid, intent) if pid else user_text
+            upstream_md = (
+                await self._build_generation_upstream(pid, intent, references)
+                if pid
+                else user_text
+            )
             doc = await generate(intent, upstream_md or user_text, session_id=session_id)
             for chunk in _chunks(doc["markdown"], 60):
                 yield chunk
@@ -190,6 +208,74 @@ class Orchestrator:
         from ...services.artifact_helpers import latest_content
 
         return await latest_content(self.db, pid, up)
+
+    @staticmethod
+    def _material_text(content: str) -> str:
+        """资料工件版本内容 → 可读正文。content 可能是结构化 JSON 或纯文本（transform 结果）。"""
+        try:
+            d = json.loads(content)
+            if isinstance(d, dict):
+                raw = (d.get("raw_text") or "").strip()
+                if raw:
+                    return raw
+                kp = d.get("key_points") or []
+                return (str(d.get("summary", "")) + "\n" + "\n".join(kp)).strip()
+        except Exception:
+            pass
+        return content or ""
+
+    async def _reference_context(self, pid, references: list[str] | None = None) -> str:
+        """把「参考资料」拼成生成上下文。
+
+        references 指定则仅取这些 material id；否则取全部「已定稿且完成内容解析」的资料。
+        """
+        from ...services.artifact_helpers import latest_version
+
+        q = (
+            select(Artifact)
+            .where(
+                Artifact.project_id == pid,
+                Artifact.type == "material_parsed",
+                Artifact.archived_at.is_(None),
+            )
+            .order_by(Artifact.created_at)
+        )
+        arts = (await self.db.execute(q)).scalars().all()
+        ref_set = {str(r) for r in references} if references else None
+        chosen = []
+        for a in arts:
+            if ref_set is not None:
+                if str(a.id) in ref_set:
+                    chosen.append(a)
+            elif a.status == "finalized" and bool((a.extra or {}).get("content_parsed")):
+                chosen.append(a)
+        parts: list[str] = []
+        for a in chosen:
+            v = await latest_version(self.db, a.id)
+            text = self._material_text((v.content if v else "") or "")
+            if text.strip():
+                parts.append(f"## 参考资料：{a.title}\n{text.strip()}")
+        return "\n\n".join(parts)
+
+    async def _build_generation_upstream(
+        self, pid, kind, references: list[str] | None = None
+    ) -> str:
+        """组合生成上游：参考资料 + 链路上游工件（CRD←ORD、PRD←CRD）。"""
+        from ...services.artifact_helpers import latest_content
+
+        refs = await self._reference_context(pid, references)
+        if kind == "crd":
+            ord_md = await latest_content(self.db, pid, "ord")
+            head = f"# 上游 ORD\n{ord_md}\n\n" if ord_md.strip() else ""
+            body = f"# 参考资料\n{refs}" if refs.strip() else ""
+            return (head + body).strip()
+        if kind == "prd":
+            crd_md = await latest_content(self.db, pid, "crd")
+            head = f"# 上游 CRD\n{crd_md}\n\n" if crd_md.strip() else ""
+            body = f"# 参考资料\n{refs}" if refs.strip() else ""
+            return (head + body).strip()
+        # ord：资料即上游（回落到旧的 summary/key_points 拼装）
+        return refs.strip() or await self._upstream_md(pid, "ord")
 
     async def _save_requirement(self, pid, kind, doc, session_id, hitl):
         from ...services.rtm import add_edges, add_nodes
@@ -251,16 +337,70 @@ class Orchestrator:
                 },
             )
 
+    async def _save_edit_pending(self, pid, kind, target_id, old_md, new_md, session_id, hitl):
+        """定向编辑（问题2）：对当前工件切 update diff 块，建 PendingChange(op=update)，
+        **不立即落新版本**——按块确认后由 pending_changes 写回。target_id=当前工件。"""
+        if not target_id:
+            from ...services.artifact_helpers import latest_artifact
+
+            art = await latest_artifact(self.db, pid, kind)
+            target_id = art.id if art else None
+        if not target_id or old_md == new_md:
+            return None
+        blocks = _to_diff_blocks_update(old_md, new_md)
+        if not blocks:
+            return None
+        pc = PendingChange(
+            project_id=pid,
+            target_type="artifact",
+            target_id=target_id,
+            op="update",
+            diff={
+                "type": kind,
+                "title": kind.upper(),
+                "note": "对话定向编辑，待按块确认",
+                # 写回所需：保存编辑前后全文，pending 确认时据 confirmed 块重建新版本
+                "oldMd": old_md,
+                "newMd": new_md,
+            },
+            diff_blocks=blocks,
+            source_actor="agent:orchestrator:edit",
+            hitl_mode=hitl,
+        )
+        self.db.add(pc)
+        await self.db.commit()
+        await self.db.refresh(pc)
+        await publish(
+            session_id,
+            "hitl.request",
+            {"pending_change_id": str(pc.id), "kind": kind, "count": len(blocks), "op": "edit"},
+        )
+        return pc
+
     def _route(self, text: str) -> str:
         t = text.lower().strip()
         if any(t.endswith(e) for e in (".md", ".pdf", ".docx", ".png", ".jpg", ".jpeg")) or t.startswith("http"):
             return "parse_material"
         if t.startswith("raw_text:") or "解析资料" in text or "解析这" in text:
             return "parse_material"
+        # 编辑意图（问题2）：对话=局部改。含修改动词 → 定向编辑当前文档（不整篇重生成）。
+        # 注意：必须在 ord/crd/prd 贪心匹配之前，否则「把 CR-003 改成…」会被当成整篇生成 CRD。
+        if self._is_edit_intent(text):
+            return "edit"
         for k in ("prd", "crd", "ord"):
             if k in t:
                 return k
         return "chat"
+
+    # 修改动词（编辑意图）；命中且非「生成/重新生成」整篇指令时视为定向编辑
+    _EDIT_VERBS = ("改", "修改", "更新", "删除", "调整", "补充", "替换", "增加", "去掉", "改成", "改为")
+    _GEN_VERBS = ("生成", "重新生成", "重生成", "regenerate")
+
+    def _is_edit_intent(self, text: str) -> bool:
+        t = text.strip()
+        if any(g in t for g in self._GEN_VERBS):
+            return False  # 「生成/重新生成 CRD」= 整篇，不算编辑
+        return any(v in t for v in self._EDIT_VERBS)
 
 
 def _chunks(s: str, n: int):

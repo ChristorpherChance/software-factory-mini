@@ -12,6 +12,7 @@ from ...config import settings
 from ...models.entities import Message, Session
 from ...core.events import publish
 from ...agents.orchestrator.state_machine import Orchestrator
+from ...agents.requirement.generator import extract_edges
 from ._common import ok, paged, idem_get, idem_put
 
 router = APIRouter(tags=["messages"])
@@ -63,6 +64,104 @@ async def _pi_ws_stream(sid: str, user_text: str, aid: str) -> str:
     return buf
 
 
+async def _pi_ws_generate(
+    sid: str, kind: str, upstream: str, prompt_override: str | None, aid: str
+) -> str:
+    """文档生成（CRD/PRD/ORD）的真 token 流式：走 agent-service WS `generate` 通道。
+
+    与 _pi_ws_stream 同构，但发送 {type:'generate', kind, upstream, systemPrompt}，
+    使 agent-service 临时清空工具 + 覆写 systemPrompt（用户配置的 Agent），DeepSeek 逐 token 出文。
+    返回聚合 markdown；空流或异常向上抛，由调用方回落本地编排（铁律#3）。
+    """
+    import httpx
+    from httpx_ws import aconnect_ws
+
+    headers = {"Authorization": f"Bearer {settings.auth_bearer_token}"}
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post(
+            f"{settings.pi_base}/sessions", json={"session_id": sid}, headers=headers
+        )
+        r.raise_for_status()
+
+    buf = ""
+    ws_url = f"{settings.pi_ws_base}/sessions/{sid}"
+    async with aconnect_ws(ws_url, headers=headers) as ws:
+        await ws.send_text(
+            json.dumps(
+                {
+                    "type": "generate",
+                    "kind": kind,
+                    "upstream": upstream,
+                    "systemPrompt": prompt_override or "",
+                }
+            )
+        )
+        while True:
+            ev = json.loads(await ws.receive_text())
+            t = ev.get("type")
+            if t == "message.delta":
+                delta = ev.get("text", "")
+                if delta:
+                    buf += delta
+                    await publish(
+                        sid, "message.delta", {"msg_id": aid, "delta": delta, "role": "assistant"}
+                    )
+            elif t == "tool.call":
+                await publish(sid, "tool.call", ev)
+            elif t == "message.end":
+                break
+    if not buf.strip():
+        raise RuntimeError("pi WS produced empty requirement")
+    return buf
+
+
+async def _pi_ws_edit(
+    sid: str, current_doc: str, instruction: str, prompt_override: str | None, aid: str
+) -> str:
+    """定向编辑（问题2）真 token 流式：走 agent-service WS `edit` 通道，逐 token 推送修改后全文。
+    返回完整修改后文档；空流/异常向上抛，由调用方回落（铁律#3）。"""
+    import httpx
+    from httpx_ws import aconnect_ws
+
+    headers = {"Authorization": f"Bearer {settings.auth_bearer_token}"}
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post(
+            f"{settings.pi_base}/sessions", json={"session_id": sid}, headers=headers
+        )
+        r.raise_for_status()
+
+    buf = ""
+    ws_url = f"{settings.pi_ws_base}/sessions/{sid}"
+    async with aconnect_ws(ws_url, headers=headers) as ws:
+        await ws.send_text(
+            json.dumps(
+                {
+                    "type": "edit",
+                    "currentDoc": current_doc,
+                    "instruction": instruction,
+                    "systemPrompt": prompt_override or "",
+                }
+            )
+        )
+        while True:
+            ev = json.loads(await ws.receive_text())
+            t = ev.get("type")
+            if t == "message.delta":
+                delta = ev.get("text", "")
+                if delta:
+                    buf += delta
+                    await publish(
+                        sid, "message.delta", {"msg_id": aid, "delta": delta, "role": "assistant"}
+                    )
+            elif t == "tool.call":
+                await publish(sid, "tool.call", ev)
+            elif t == "message.end":
+                break
+    if not buf.strip():
+        raise RuntimeError("pi WS produced empty edit")
+    return buf
+
+
 def _dto(m: Message) -> dict:
     return {
         "id": str(m.id),
@@ -74,12 +173,20 @@ def _dto(m: Message) -> dict:
     }
 
 
-async def _run_orchestrator(sid: str, user_text: str, hitl_mode: str | None):
+async def _run_orchestrator(
+    sid: str,
+    user_text: str,
+    hitl_mode: str | None,
+    references: list[str] | None = None,
+    target_type: str | None = None,
+    target_artifact_id: str | None = None,
+):
     """后台任务：独立 DB session 跑编排，逐 token publish。
 
     provider=pi：先试 agent-service WS 真流式；失败回落本地编排假流式（铁律#3）。
     provider=stub/anthropic：走本地 Orchestrator 假流式（不变）。
     无论哪条路径，落库 + RTM + pending 由本地 Orchestrator 负责（pi 路径在 WS 后补跑薄监督器，见 Phase 3）。
+    target_type/target_artifact_id：前端当前正在看的工件（crd/prd），供「对话定向编辑」定位目标。
     """
     async with SessionLocal() as db:
         assistant = Message(session_id=sid, role="assistant", content="", status="streaming")
@@ -105,10 +212,87 @@ async def _run_orchestrator(sid: str, user_text: str, hitl_mode: str | None):
                     return
                 except Exception:  # noqa: BLE001
                     buf = ""  # WS 失败 → 回落假流式
-            # 文档生成类：落到下方 Orchestrator.handle（薄监督器，含落库）
+            elif intent == "edit":
+                # 对话定向编辑（问题2）：只改指定条目 → 切块 → 建 pending（不落新版本，按块确认后写回）。
+                try:
+                    pid, sess_hitl, _ = await orch._project_and_hitl(sid)
+                    hitl = hitl_mode or sess_hitl
+                    kind = (target_type or "crd").lower()
+                    if kind not in ("crd", "prd", "ord"):
+                        kind = "crd"
+                    from ...services.artifact_helpers import latest_content, latest_artifact
+
+                    old_md = await latest_content(db, pid, kind) if pid else ""
+                    if not old_md.strip():
+                        # 没有可编辑的文档 → 回落普通对话流式
+                        raise RuntimeError("no document to edit")
+                    # 取该 slot 的当前 Agent Prompt 作为领域提示词
+                    prompt_override = None
+                    try:
+                        from ...services.prompt_resolve import load_active_prompts
+
+                        prompt_override = (await load_active_prompts(db)).get(f"requirement.{kind}")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    new_md = await _pi_ws_edit(sid, old_md, user_text, prompt_override, aid)
+                    # 定位目标工件 id（前端传的优先，否则取最新同类型）
+                    tid = target_artifact_id
+                    if not tid and pid:
+                        art = await latest_artifact(db, pid, kind)
+                        tid = str(art.id) if art else None
+                    if pid:
+                        await orch._save_edit_pending(
+                            pid, kind, tid, old_md, new_md, sid, hitl
+                        )
+                    # 对话区已流式显示修改后全文（new_md=buf）；落库该助手消息内容即流式内容。
+                    assistant.content, assistant.status = new_md, "completed"
+                    await db.commit()
+                    await publish(sid, "message.end", {"msg_id": aid, "finish_reason": "stop"})
+                    return
+                except Exception:  # noqa: BLE001
+                    buf = ""  # 失败 → 回落本地 handle
+            elif intent in ("ord", "crd", "prd"):
+                # 文档生成：真 token 流式（WS generate 通道）+ 复用本地落库逻辑。
+                try:
+                    pid, sess_hitl, _ = await orch._project_and_hitl(sid)
+                    hitl = hitl_mode or sess_hitl
+                    upstream = (
+                        await orch._build_generation_upstream(pid, intent, references)
+                        if pid
+                        else user_text
+                    )
+                    # 注入用户在设置页配置的「当前 Agent Prompt」→ 覆写 agent-service systemPrompt
+                    prompt_override = None
+                    try:
+                        from ...core.prompt_ctx import set_active_prompts
+                        from ...services.prompt_resolve import load_active_prompts
+
+                        prompts = await load_active_prompts(db)
+                        set_active_prompts(prompts)
+                        prompt_override = prompts.get(f"requirement.{intent}")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    buf = await _pi_ws_generate(
+                        sid, intent, upstream or user_text, prompt_override, aid
+                    )
+                    if pid:
+                        await orch._save_requirement(
+                            pid,
+                            intent,
+                            {"markdown": buf, "edges": extract_edges(buf)},
+                            sid,
+                            hitl,
+                        )
+                    assistant.content, assistant.status = buf, "completed"
+                    await db.commit()
+                    await publish(sid, "message.end", {"msg_id": aid, "finish_reason": "stop"})
+                    return
+                except Exception:  # noqa: BLE001
+                    buf = ""  # WS/生成失败 → 回落本地 handle（阻塞假流式或 stub）
+            # 其它意图或上面回落：落到下方 Orchestrator.handle（薄监督器，含落库）
 
         try:
-            async for delta in Orchestrator(db).handle(sid, user_text, hitl_mode):
+            async for delta in Orchestrator(db).handle(sid, user_text, hitl_mode, references):
                 buf += delta
                 await publish(
                     sid,
@@ -152,7 +336,14 @@ async def send(
     db.add(m)
     await db.commit()
     await db.refresh(m)
-    asyncio.create_task(_run_orchestrator(sid, body["content"], hitl))
+    references = body.get("references") or None
+    target_type = body.get("targetType")
+    target_artifact_id = body.get("targetArtifactId")
+    asyncio.create_task(
+        _run_orchestrator(
+            sid, body["content"], hitl, references, target_type, target_artifact_id
+        )
+    )
     return idem_put(idem, ok(_dto(m)))
 
 
