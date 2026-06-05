@@ -17,6 +17,7 @@ from .entities import (
     Endpoint,
     SessionSettingOverride,
     SettingAudit,
+    AgentPromptBinding,
 )
 
 __all__ = [
@@ -37,4 +38,5 @@ __all__ = [
     "Endpoint",
     "SessionSettingOverride",
     "SettingAudit",
+    "AgentPromptBinding",
 ]

@@ -37,6 +37,13 @@ function expandCommand(content: string): string {
   return `${tpl}\n${rest}`;
 }
 
+/** 最小格式约束：附在用户自定义提示词末尾，保证后端 RTM 正则可解析（编号 + 「（上溯：…）」）。
+ *  仅含格式约束、不含内容指令，不喧宾夺主。 */
+const FORMAT_HINT =
+  "\n\n---\n[输出格式约束]\n" +
+  "需求项请用 Markdown 列表，每条带编号（CRD 用 CR-001、PRD 用 PRD-F-001/PRD-NFR-001）；" +
+  "下游条目以「（上溯：<上游编号 或 资料>）」标注来源；用 #/## 分节。仅输出文档正文。";
+
 /** WS 事件（对齐前端/后端 7 事件语义子集）。 */
 export type WsEvent =
   | { type: "message.delta"; text: string }
@@ -67,12 +74,17 @@ export class AgentSession {
   private lastText = "";
   /** 工具发出的结构化结果（runStructure 用，Phase 3 由 emit 工具回填）。 */
   private lastStructured: Record<string, unknown> | null = null;
+  /** 系统默认 systemPrompt（设置页未配置时回落）。 */
+  private defaultSystemPrompt: string;
+  /** postGenerate 用：整轮结束（agent_end）时一次性恢复 tools/systemPrompt。 */
+  private pendingRestore: (() => void) | null = null;
 
   constructor(public id: string) {
     ensureProviders();
+    this.defaultSystemPrompt = readProject("SYSTEM.md") || "你是软件工厂的需求工程 Agent。";
     this.agent = new Agent({
       initialState: {
-        systemPrompt: readProject("SYSTEM.md") || "你是软件工厂的需求工程 Agent。",
+        systemPrompt: this.defaultSystemPrompt,
         model: buildModel(),
         thinkingLevel: "off", // D4：确定性，关思考
         tools: allTools,
@@ -121,6 +133,12 @@ export class AgentSession {
         case "agent_end":
           // 整轮结束才发 WS message.end（内核可能跑多个 message_end 子轮，不可逐个转发）
           this.emit({ type: "message.end" });
+          // postGenerate 临时覆写的 tools/systemPrompt 在整轮结束后恢复
+          if (this.pendingRestore) {
+            const r = this.pendingRestore;
+            this.pendingRestore = null;
+            r();
+          }
           break;
         case "tool_execution_start":
           this.emit({ type: "tool.call", tool: ev.toolName, status: "running" });
@@ -161,12 +179,18 @@ export class AgentSession {
     if (errMsg) throw new Error(`agent error: ${errMsg}`);
   }
 
-  /** 资料结构化：纯文本任务，临时清空工具（Phase 5 接 tooling 后再调整）。 */
-  async runStructure(text: string): Promise<Record<string, unknown>> {
+  /** 资料结构化：纯文本任务，临时清空工具（Phase 5 接 tooling 后再调整）。
+   *  promptOverride：设置页配置的「当前 Prompt」，临时覆写 systemPrompt（finally 恢复）。 */
+  async runStructure(
+    text: string,
+    promptOverride?: string,
+  ): Promise<Record<string, unknown>> {
     this.lastText = "";
     this.lastStructured = null;
     const savedTools = this.agent.state.tools;
+    const savedSys = this.agent.state.systemPrompt;
     this.agent.state.tools = [];
+    if (promptOverride && promptOverride.trim()) this.agent.state.systemPrompt = promptOverride;
     try {
       await this.agent.prompt(`/structure\n${text}`);
       await this.agent.waitForIdle();
@@ -177,14 +201,22 @@ export class AgentSession {
       return this.lastStructured ?? { _raw: this.lastText };
     } finally {
       this.agent.state.tools = savedTools;
+      this.agent.state.systemPrompt = savedSys;
     }
   }
 
-  /** 需求生成：纯文本输出任务，临时清空工具（避免 thinking 模型陷入工具循环/terminate）。 */
-  async runRequirement(kind: string, upstream: string): Promise<string> {
+  /** 需求生成：纯文本输出任务，临时清空工具（避免 thinking 模型陷入工具循环/terminate）。
+   *  promptOverride：设置页配置的「当前 Prompt」，临时覆写 systemPrompt（finally 恢复）。 */
+  async runRequirement(
+    kind: string,
+    upstream: string,
+    promptOverride?: string,
+  ): Promise<string> {
     this.lastText = "";
     const savedTools = this.agent.state.tools;
+    const savedSys = this.agent.state.systemPrompt;
     this.agent.state.tools = [];
+    if (promptOverride && promptOverride.trim()) this.agent.state.systemPrompt = promptOverride;
     try {
       await this.agent.prompt(expandCommand(`/${kind}\n${upstream}`));
       await this.agent.waitForIdle();
@@ -193,12 +225,93 @@ export class AgentSession {
       return this.lastText;
     } finally {
       this.agent.state.tools = savedTools;
+      this.agent.state.systemPrompt = savedSys;
     }
   }
 
   /** 普通消息（WS 路径用，不等待，事件实时推）。命令自动展开模板。 */
   post(content: string): void {
     void this.agent.prompt(expandCommand(content));
+  }
+
+  /** 文档生成（WS 真流式）：临时清空工具 + 覆写 systemPrompt（用户配置的 Agent），
+   *  发 `/<kind>\n<upstream>` 让 DeepSeek 逐 token 出文；整轮结束（agent_end）后恢复。
+   *  清空工具沿用 runRequirement 经验，避免 thinking 模型陷入工具循环/terminate。
+   *
+   *  问题1 修复：当传入 systemPrompt（用户在设置页配置的 Agent 提示词）时，**以用户提示词为主**——
+   *  不再用 expandCommand 把 .pi/prompts 骨架拼进 user message（那会盖过 systemPrompt）；
+   *  仅在 systemPrompt 末尾附一行最小格式约束，保证 RTM 正则可解析（编号 + 「（上溯：…）」）。
+   *  无 systemPrompt 时回落骨架模板（保留 stub/默认行为）。 */
+  postGenerate(kind: string, upstream: string, systemPrompt?: string): void {
+    this.beginOverride(systemPrompt, true);
+    if (systemPrompt && systemPrompt.trim()) {
+      // 用户提示词为主：直接把上游输入作为 user message，systemPrompt 已含全部指令。
+      void this.agent.prompt(upstream);
+    } else {
+      void this.agent.prompt(expandCommand(`/${kind}\n${upstream}`));
+    }
+  }
+
+  /** 定向编辑（问题2）：systemPrompt = 编辑器人设(+用户配置)，user message = 当前完整文档 + 修改指令。
+   *  输出完整修改后文档（后端用 difflib 切块、按块确认后写回）。 */
+  postEdit(currentDoc: string, instruction: string, systemPrompt?: string): void {
+    const editorPersona =
+      "你是需求文档编辑器。下面给出【当前完整文档】与【修改指令】。" +
+      "请只按指令修改对应条目，保持其它所有内容逐字不变，输出**完整的修改后文档**（Markdown，含未改动部分）。" +
+      "不要解释、不要只输出片段。保留原有编号与「（上溯：…）」标注样式。";
+    const sys =
+      systemPrompt && systemPrompt.trim()
+        ? `${editorPersona}\n\n（领域提示词）\n${systemPrompt}`
+        : editorPersona;
+    this.beginOverride(sys, true);
+    void this.agent.prompt(`【当前完整文档】\n${currentDoc}\n\n【修改指令】\n${instruction}`);
+  }
+
+  /** 美化（问题1）：把用户粘贴的草稿提示词整理为结构清晰、可直接用于生成的规范提示词。 */
+  postBeautify(draft: string): void {
+    const sys =
+      "你是提示词工程师。把用户给出的草稿整理为结构清晰、表述规范的【系统提示词】，" +
+      "用于指导需求文档生成 Agent。保留草稿的全部意图与约束，补全结构（角色/职责/输出格式/约束），" +
+      "但不要臆造与草稿无关的新规则。只输出整理后的提示词正文，不要解释。";
+    this.beginOverride(sys, false); // 美化输出是提示词本身，不附需求格式约束
+    void this.agent.prompt(draft);
+  }
+
+  /** 临时清空工具 + 覆写 systemPrompt，记录 agent_end 后的恢复闭包（postGenerate/Edit/Beautify 共用）。
+   *  withFormatHint：是否在 systemPrompt 末尾附最小格式约束（需求生成/编辑用，美化不用）。 */
+  private beginOverride(systemPrompt?: string, withFormatHint = false): void {
+    const savedTools = this.agent.state.tools;
+    const savedSys = this.agent.state.systemPrompt;
+    this.agent.state.tools = [];
+    if (systemPrompt && systemPrompt.trim()) {
+      this.agent.state.systemPrompt = systemPrompt + (withFormatHint ? FORMAT_HINT : "");
+    }
+    this.pendingRestore = () => {
+      this.agent.state.tools = savedTools;
+      this.agent.state.systemPrompt = savedSys;
+    };
+  }
+
+  /** 美化（同步，HTTP 路径）：等待完整结果返回整理后的提示词。 */
+  async runBeautify(draft: string): Promise<string> {
+    this.lastText = "";
+    const savedTools = this.agent.state.tools;
+    const savedSys = this.agent.state.systemPrompt;
+    this.agent.state.tools = [];
+    this.agent.state.systemPrompt =
+      "你是提示词工程师。把用户给出的草稿整理为结构清晰、表述规范的【系统提示词】，" +
+      "用于指导需求文档生成 Agent。保留草稿的全部意图与约束，补全结构（角色/职责/输出格式/约束），" +
+      "但不要臆造与草稿无关的新规则。只输出整理后的提示词正文，不要解释。";
+    try {
+      await this.agent.prompt(draft);
+      await this.agent.waitForIdle();
+      this.assertNoError();
+      if (!this.lastText.trim()) throw new Error("agent produced empty beautify result");
+      return this.lastText;
+    } finally {
+      this.agent.state.tools = savedTools;
+      this.agent.state.systemPrompt = savedSys;
+    }
   }
 
   setStructured(s: Record<string, unknown>): void {

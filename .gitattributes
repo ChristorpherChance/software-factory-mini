@@ -1,0 +1,19 @@
+# 统一行尾，避免跨平台 checkout 时被 core.autocrlf 改坏导致脚本无法运行。
+# 默认按内容自动处理文本/二进制。
+* text=auto
+
+# Shell 脚本必须 LF —— 带 CR 会让 bash 把 \r 当命令一部分而报错。
+*.sh    text eol=lf
+
+# Windows 批处理 / PowerShell 必须 CRLF —— LF 会让 cmd.exe 解析错乱、闪退。
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# 二进制文件不做行尾转换。
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.ico   binary
+*.pen   binary
+*.db    binary

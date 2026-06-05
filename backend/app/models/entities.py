@@ -279,3 +279,29 @@ class SettingAudit(Base):
     new_value: Mapped[dict | None] = mapped_column(JSON)
     actor: Mapped[str]
     created_at = created()
+
+
+# ---------------------------------------------------------------------------
+# 各阶段 Agent Prompt 配置（复用 Artifact(type=agent_prompt)+ArtifactVersion 存多版本）
+# ---------------------------------------------------------------------------
+class AgentPromptBinding(Base):
+    """各阶段 Agent 子槽位的「当前 Prompt 版本」绑定。
+
+    - 多版本 = 该 Artifact 的多条 ArtifactVersion；version=1/author=system 为系统默认（只读）。
+    - current_version 指针指向「当前生效」版本（与 Artifact.current_version=最高版号 区分）。
+    - 全局共享：project_id 指向自动创建的容器项目（见 services/prompt_seed）。
+    - 新表，create_all 自动建；复用 ArtifactVersion.note 存版本名，无新列、无需 ALTER。
+    """
+
+    __tablename__ = "agent_prompt_binding"
+    __table_args__ = (
+        UniqueConstraint("project_id", "agent_slot", name="uq_agent_prompt_binding"),
+    )
+    id: Mapped[str] = PK()
+    project_id: Mapped[str | None] = FK("project.id", nullable=True)
+    # material.file_parse | material.content_parse | requirement.{crd,prd,rtm}
+    agent_slot: Mapped[str]
+    artifact_id: Mapped[str] = FK("artifact.id")
+    current_version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at = created()
+    updated_at = updated()

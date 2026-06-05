@@ -71,17 +71,29 @@ async def get_one(cid: str, db: AsyncSession = Depends(get_db), _=Depends(requir
 
 async def _apply(db: AsyncSession, c: PendingChange, diff: dict):
     """落库变更。本地编排已直接落工件，故此处对 artifact/create 做幂等记录；
-    其余 target_type 按差异落库。"""
+    其余 target_type 按差异落库。
+
+    问题2：对话定向编辑产生 op=update + diff.oldMd/newMd + diff_blocks。
+    按 confirmed 块把 newMd 的变更应用到 oldMd（rejected 块跳过），落为新 ArtifactVersion。
+    """
     if c.target_type == "artifact" and c.op == "update" and c.target_id:
         a = await db.get(Artifact, c.target_id)
         if a:
+            # 优先：定向编辑（含 oldMd/newMd）→ 按 confirmed 块重建
+            if isinstance(diff, dict) and diff.get("oldMd") is not None:
+                content = _rebuild_from_blocks(
+                    diff.get("oldMd", ""), diff.get("newMd", ""), c.diff_blocks or []
+                )
+            else:
+                content = diff.get("content", "")
             nv = a.current_version + 1
             db.add(
                 ArtifactVersion(
                     artifact_id=a.id,
                     version=nv,
-                    content=diff.get("content", ""),
+                    content=content,
                     author=c.source_actor,
+                    note="对话定向编辑确认" if diff.get("oldMd") is not None else None,
                 )
             )
             a.current_version, a.version = nv, a.version + 1
@@ -93,6 +105,48 @@ async def _apply(db: AsyncSession, c: PendingChange, diff: dict):
                     setattr(t, k, v)
             t.version += 1
     # artifact/create、delegate/invoke、rtm/setting：编排/服务已处理，approve 仅记录决策
+
+
+def _rebuild_from_blocks(old_md: str, new_md: str, blocks: list[dict]) -> str:
+    """按 confirmed 块把 new_md 的变更合并到 old_md（问题2 按块写回）。
+
+    策略：全部块 confirmed → 直接用 new_md（最常见，最稳）；
+    含 rejected → 用 difflib 把 old/new 对齐，仅对 confirmed 的变更块取 new 侧、rejected 取 old 侧。
+    无 blocks → 回落 new_md。
+    """
+    import difflib
+
+    if not blocks:
+        return new_md or old_md
+    states = {b.get("id"): b.get("state") for b in blocks}
+    if all(s == "confirmed" for s in states.values()):
+        return new_md
+    if all(s == "rejected" for s in states.values()):
+        return old_md
+
+    # 混合：按 difflib opcodes 顺序映射回 blocks（与 _to_diff_blocks_update 同序），逐段取舍。
+    old_lines = (old_md or "").splitlines()
+    new_lines = (new_md or "").splitlines()
+    sm = difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False)
+    out: list[str] = []
+    bi = 0  # 与 blocks 对齐的变更序号（equal 段不对应块）
+    block_ids = [b.get("id") for b in blocks]
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            out.extend(old_lines[i1:i2])
+            continue
+        bid = block_ids[bi] if bi < len(block_ids) else None
+        accepted = states.get(bid) == "confirmed"
+        bi += 1
+        if tag == "insert":
+            if accepted:
+                out.extend(new_lines[j1:j2])
+        elif tag == "delete":
+            if not accepted:  # 拒绝删除 → 保留旧行
+                out.extend(old_lines[i1:i2])
+        else:  # replace
+            out.extend(new_lines[j1:j2] if accepted else old_lines[i1:i2])
+    return "\n".join(out)
 
 
 def _set_all_blocks(c: PendingChange, state: str) -> None:
@@ -109,9 +163,10 @@ async def approve(cid: str, db: AsyncSession = Depends(get_db), actor=Depends(re
     c = await db.get(PendingChange, cid)
     if not c or c.status != "pending":
         raise AppError(404, "pending change not found")
+    # 先把所有块置 confirmed，再 _apply（按块写回依赖块 state；整体确认=全部接受）
+    _set_all_blocks(c, "confirmed")
     await _apply(db, c, c.diff)
     c.status = "approved"
-    _set_all_blocks(c, "confirmed")
     db.add(HitlDecision(pending_change_id=c.id, decision="approve", decided_by=actor["actor"]))
     await db.commit()
     await publish(str(c.project_id), "task.update", {"task_id": str(c.id), "status": "approved"})

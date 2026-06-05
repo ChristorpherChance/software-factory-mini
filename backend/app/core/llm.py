@@ -14,6 +14,7 @@ import hashlib
 import json
 
 from ..config import settings
+from .prompt_ctx import get_active_prompt
 
 # 资料结构化输出 schema（骨架 §5.2 / M1 §7.3）
 MATERIAL_SCHEMA = {
@@ -115,6 +116,33 @@ def _stub_structure(text: str) -> dict:
     }
 
 
+def _salient_points(text: str, n: int) -> list[str]:
+    """从上游/参考资料文本中抽取若干要点（标题/列表项/句子），跳过脚手架标题。"""
+    pts: list[str] = []
+    seen: set[str] = set()
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith("#") and ("参考资料" in s or "上游" in s):
+            continue  # 跳过 "# 参考资料" / "## 参考资料：xxx" / "# 上游 ORD" 等脚手架
+        if s.startswith(("<", "|", "```")):
+            continue  # 跳过 HTML 片段（如 <aside>）/表格/代码围栏
+        m = re.match(r"^#{1,6}\s+(.*)$", s) or re.match(r"^[-*]\s+(.*)$", s)
+        cand = (m.group(1) if m else s)
+        cand = re.sub(r"[*`>]+", "", cand).strip(" :：-#。.")
+        if len(cand) < 4:
+            continue
+        cand = cand[:60]
+        if cand in seen:
+            continue
+        seen.add(cand)
+        pts.append(cand)
+        if len(pts) >= n:
+            break
+    return pts
+
+
 def _stub_requirement(kind: str, upstream: str) -> str:
     kind = kind.lower()
     digest = hashlib.sha256((kind + upstream).encode()).hexdigest()[:6]
@@ -137,24 +165,37 @@ def _stub_requirement(kind: str, upstream: str) -> str:
         return "\n".join(body)
 
     if kind == "crd":
-        # 从 ORD 抽取 R 编号 → 每条派生一条 CR（保证 1:1 完整追溯链）
+        # 有上游 ORD（含 R 编号）：1:1 派生 CR，保证完整追溯链。
         rcodes = sorted(set(re.findall(r"R-\d+", upstream)), key=lambda c: int(c.split("-")[1]))
-        rcodes = rcodes or ["R-001", "R-002"]
         body = ["# 客户需求文档 CRD", "## 客户需求"]
-        for i, rc in enumerate(rcodes, 1):
-            body.append(f"- CR-{i:03d} 客户需求项 {i}（上溯：{rc}）")
+        if rcodes:
+            for i, rc in enumerate(rcodes, 1):
+                body.append(f"- CR-{i:03d} 客户需求项 {i}（上溯：{rc}）")
+        else:
+            # 无 ORD：直接从参考资料要点派生 CR，上溯标注「资料」。
+            pts = _salient_points(upstream, 6)
+            if pts:
+                for i, p in enumerate(pts, 1):
+                    body.append(f"- CR-{i:03d} {p}（上溯：资料）")
+            else:
+                body.append("-（暂无参考资料或上游：请先在资料阶段定稿参考资料后再生成）")
         body += ["## 验收标准", "- 每条客户需求均可被 PRD 功能点覆盖且可验证。"]
         return "\n".join(body)
 
     # prd：从 CRD 抽取 CR 编号 → 每条派生一条 PRD-F，并补一条 PRD-NFR
     crcodes = sorted(set(re.findall(r"CR-\d+", upstream)), key=lambda c: int(c.split("-")[1]))
-    crcodes = crcodes or ["CR-001", "CR-002"]
     body = ["# 产品需求文档 PRD", "## 功能需求"]
-    for i, cc in enumerate(crcodes, 1):
-        body.append(f"- PRD-F-{i:03d} 功能点 {i}（上溯：{cc}）")
+    if crcodes:
+        for i, cc in enumerate(crcodes, 1):
+            body.append(f"- PRD-F-{i:03d} 功能点 {i}（上溯：{cc}）")
+    else:
+        pts = _salient_points(upstream, 6)
+        for i, p in enumerate(pts or ["功能点 1"], 1):
+            body.append(f"- PRD-F-{i:03d} {p}（上溯：CR-001）")
+    nfr_up = (crcodes or ["CR-001"])[0]
     body += [
         "## 非功能需求",
-        f"- PRD-NFR-001 系统可在本地单机运行（上溯：{crcodes[0]}）。",
+        f"- PRD-NFR-001 系统可在本地单机运行（上溯：{nfr_up}）。",
         "## 验收",
         "- 三件套自检全绿且 RTM 覆盖率≥0.85 方可定稿。",
     ]
@@ -193,7 +234,8 @@ async def _anthropic_structure(text: str, session_id: str | None = None) -> dict
             max_tokens=4096,
             temperature=0,
             top_p=1,
-            system=MATERIAL_SYSTEM,
+            # 当前绑定 Prompt（设置页配置）优先，回落系统默认
+            system=get_active_prompt("material.file_parse") or MATERIAL_SYSTEM,
             tools=[
                 {
                     "name": "emit",
@@ -273,7 +315,8 @@ async def _anthropic_requirement(kind: str, upstream: str, session_id: str | Non
             model=settings.llm_model,
             max_tokens=8192,
             temperature=0.2,
-            system=_REQ_PROMPT[kind.lower()],
+            # 当前绑定 Prompt（设置页配置）优先，回落系统默认
+            system=get_active_prompt(f"requirement.{kind.lower()}") or _REQ_PROMPT[kind.lower()],
             messages=[{"role": "user", "content": upstream}],
         )
         text = "".join(b.text for b in resp.content if b.type == "text")
@@ -320,7 +363,12 @@ async def _pi_structure(text: str) -> dict:
     async with httpx.AsyncClient(timeout=_PI_TIMEOUT) as c:
         r = await c.post(
             f"{settings.pi_base}/structure",
-            json={"text": text, "session_id": None},
+            json={
+                "text": text,
+                "session_id": None,
+                # 当前绑定 Prompt（设置页配置）覆写 agent-service systemPrompt
+                "prompt_override": get_active_prompt("material.file_parse"),
+            },
             headers={"Authorization": f"Bearer {settings.auth_bearer_token}"},
         )
         r.raise_for_status()
@@ -333,7 +381,13 @@ async def _pi_requirement(kind: str, upstream: str) -> str:
     async with httpx.AsyncClient(timeout=_PI_TIMEOUT) as c:
         r = await c.post(
             f"{settings.pi_base}/requirement",
-            json={"kind": kind, "upstream": upstream, "session_id": None},
+            json={
+                "kind": kind,
+                "upstream": upstream,
+                "session_id": None,
+                # 当前绑定 Prompt（设置页配置）覆写 agent-service systemPrompt
+                "prompt_override": get_active_prompt(f"requirement.{kind.lower()}"),
+            },
             headers={"Authorization": f"Bearer {settings.auth_bearer_token}"},
         )
         r.raise_for_status()
@@ -370,3 +424,112 @@ async def generate_requirement(kind: str, upstream: str, session_id: str | None 
     if settings.llm_provider == "anthropic" and settings.llm_api_key:
         return await _anthropic_requirement(kind, upstream, session_id=session_id)
     return _stub_requirement(kind, upstream)
+
+
+def _stub_beautify(draft: str) -> str:
+    """离线兜底：把草稿包进规范提示词骨架（不调 LLM，确定性）。"""
+    draft = (draft or "").strip() or "（空）"
+    return (
+        "# 角色\n你是需求文档生成 Agent。\n\n"
+        "# 职责\n根据上游输入生成规范的需求文档。\n\n"
+        "# 用户要求\n" + draft + "\n\n"
+        "# 输出格式\n"
+        "- 用 Markdown，#/## 分节；\n"
+        "- 每条需求带编号，下游条目以「（上溯：<上游编号 或 资料>）」标注来源；\n"
+        "- 仅输出文档正文，不要解释。\n"
+    )
+
+
+async def _pi_beautify(draft: str) -> str:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=_PI_TIMEOUT) as c:
+        r = await c.post(
+            f"{settings.pi_base}/beautify",
+            json={"draft": draft, "session_id": None},
+            headers={"Authorization": f"Bearer {settings.auth_bearer_token}"},
+        )
+        r.raise_for_status()
+        return r.json()["data"]["content"]
+
+
+async def beautify_prompt(draft: str) -> str:
+    """美化提示词（问题1）：pi 调 agent-service /beautify；其它 provider 回落 stub 模板。"""
+    if settings.llm_provider == "pi":
+        try:
+            out = await _pi_beautify(draft)
+            return out if (out and out.strip()) else _stub_beautify(draft)
+        except Exception:
+            return _stub_beautify(draft)
+    return _stub_beautify(draft)
+
+
+def _stub_edit(current_doc: str, instruction: str) -> str:
+    """离线兜底的定向编辑（问题2）：解析「把 <编号> 改成/为 <新文案>」，只替换该条整行。
+
+    支持：改成/改为/替换为 → 替换该编号行标题；删除 <编号> → 删除该行。其余原样返回。
+    确定性、无 LLM，保证 stub/CI 可跑通按块 diff。
+    """
+    import re as _re
+
+    code_pat = r"(R-\d+|CR-\d+|PRD-[A-Z]+-\d+|PRD-\d+)"
+    m_code = _re.search(code_pat, instruction)
+    if not m_code:
+        return current_doc  # 没识别到编号，不改（上层据 old==new 不建 pending）
+    code = m_code.group(1)
+    lines = current_doc.splitlines()
+
+    # 删除意图
+    if any(k in instruction for k in ("删除", "去掉")):
+        out = [ln for ln in lines if not _re.search(rf"\b{_re.escape(code)}\b", ln)]
+        return "\n".join(out)
+
+    # 替换意图：取「改成/改为/替换为/为」之后的文案
+    m_new = _re.search(r"(?:改成|改为|替换为|更新为|为)\s*[:：]?\s*(.+)$", instruction)
+    new_text = m_new.group(1).strip() if m_new else None
+    out = []
+    for ln in lines:
+        if _re.search(rf"\b{_re.escape(code)}\b", ln) and new_text:
+            # 保留「- <编号> 」前缀与「（上溯：…）」后缀，仅替换中间标题
+            m_up = _re.search(r"（上溯[:：][^）]*）", ln)
+            suffix = m_up.group(0) if m_up else ""
+            out.append(f"- {code} {new_text}{suffix}")
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
+async def _pi_edit(current_doc: str, instruction: str, prompt_override: str | None) -> str:
+    """pi 非流式编辑兜底（流式走 messages._pi_ws_edit；此处供回落/同步调用）。"""
+    import httpx
+
+    sys = (
+        "你是需求文档编辑器。只按指令修改对应条目，保持其它所有内容逐字不变，"
+        "输出完整的修改后文档（Markdown）。" + (f"\n领域提示词：{prompt_override}" if prompt_override else "")
+    )
+    async with httpx.AsyncClient(timeout=_PI_TIMEOUT) as c:
+        r = await c.post(
+            f"{settings.pi_base}/requirement",
+            json={
+                "kind": "crd",
+                "upstream": f"【当前完整文档】\n{current_doc}\n\n【修改指令】\n{instruction}",
+                "session_id": None,
+                "prompt_override": sys,
+            },
+            headers={"Authorization": f"Bearer {settings.auth_bearer_token}"},
+        )
+        r.raise_for_status()
+        return r.json()["data"]["markdown"]
+
+
+async def edit_requirement(
+    current_doc: str, instruction: str, prompt_override: str | None = None
+) -> str:
+    """定向编辑（问题2）非流式入口：pi 调 agent-service；其它回落 stub。"""
+    if settings.llm_provider == "pi":
+        try:
+            out = await _pi_edit(current_doc, instruction, prompt_override)
+            return out if (out and out.strip()) else _stub_edit(current_doc, instruction)
+        except Exception:
+            return _stub_edit(current_doc, instruction)
+    return _stub_edit(current_doc, instruction)

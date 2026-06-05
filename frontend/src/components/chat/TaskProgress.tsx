@@ -1,8 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useParams } from "next/navigation";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Check, Play, Hourglass, ChevronDown } from "lucide-react";
 import { api, type TaskDto } from "@/lib/api";
 import { useTaskStore } from "@/stores/task";
@@ -40,15 +40,17 @@ function Row({
   title,
   state,
   meta,
+  action,
 }: {
   title: string;
   state: Group;
   meta?: string;
+  action?: ReactNode;
 }) {
   return (
     <div
       className={cn(
-        "flex items-center gap-2 rounded-md px-2 py-1.5",
+        "group flex items-center gap-2 rounded-md px-2 py-1.5",
         state === "in_progress" && "bg-primary-subtle"
       )}
     >
@@ -71,6 +73,7 @@ function Row({
           {meta}
         </span>
       )}
+      {action}
     </div>
   );
 }
@@ -79,6 +82,14 @@ export function TaskProgress() {
   const { pid } = useParams<{ pid: string }>();
   const [open, setOpen] = useState(true);
   const runtimeTasks = useTaskStore((s) => s.tasks);
+  const qc = useQueryClient();
+
+  // 推进 Task：todo/blocked → in_progress → done（乐观锁 If-Match=version）
+  const advance = useMutation({
+    mutationFn: ({ id, to, version }: { id: string; to: string; version: number }) =>
+      api.transition(id, to, version),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["tasks", pid] }),
+  });
 
   // 真实 task 列表
   const { data: list } = useQuery({
@@ -96,7 +107,7 @@ export function TaskProgress() {
     const status = rt?.status ?? t.status;
     const meta =
       rt?.progress != null ? `${rt.progress}%` : t.estimate ? `${t.estimate}h` : undefined;
-    return { ...t, status, _meta: meta };
+    return { ...t, status, _meta: meta, _dbStatus: t.status };
   });
 
   const done = enriched.filter((t) => mapStatus(t.status) === "done").length;
@@ -135,14 +146,38 @@ export function TaskProgress() {
                 <div className="px-2 pb-0.5 pt-1 text-[10px] font-semibold text-text-muted">
                   {g.label}
                 </div>
-                {items.map((t) => (
-                  <Row
-                    key={t.id}
-                    title={t.title}
-                    state={g.key}
-                    meta={(t as any)._meta}
-                  />
-                ))}
+                {items.map((t) => {
+                  const dbStatus = (t as any)._dbStatus as string;
+                  const adv =
+                    dbStatus === "todo" || dbStatus === "blocked"
+                      ? { to: "in_progress", Icon: Play, title: "开始" }
+                      : dbStatus === "in_progress"
+                        ? { to: "done", Icon: Check, title: "完成" }
+                        : null;
+                  const AdvIcon = adv?.Icon;
+                  return (
+                    <Row
+                      key={t.id}
+                      title={t.title}
+                      state={g.key}
+                      meta={(t as any)._meta}
+                      action={
+                        adv && AdvIcon ? (
+                          <button
+                            onClick={() =>
+                              advance.mutate({ id: t.id, to: adv.to, version: t.version })
+                            }
+                            disabled={advance.isPending}
+                            title={adv.title}
+                            className="flex h-5 w-5 items-center justify-center rounded text-text-muted opacity-0 transition-opacity hover:bg-bg-subtle hover:text-primary group-hover:opacity-100 disabled:opacity-50"
+                          >
+                            <AdvIcon className="h-3 w-3" />
+                          </button>
+                        ) : undefined
+                      }
+                    />
+                  );
+                })}
               </div>
             );
           })}

@@ -8,7 +8,7 @@ POST /projects/{pid}/materials/{mid}/transform   内容解析：翻译/索引/�
 import json
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...deps import require_auth
@@ -23,12 +23,20 @@ from ._common import ok, paged
 router = APIRouter(tags=["materials"])
 
 
-def _flatten(structured: dict, art_id: str, title: str, status: str = "draft") -> dict:
+def _flatten(
+    structured: dict,
+    art_id: str,
+    title: str,
+    status: str = "draft",
+    content_parsed: bool = False,
+) -> dict:
     return {
         "id": art_id,
         "type": "material_parsed",
         "title": title,
         "status": status,
+        "contentParsed": content_parsed,
+        "rawText": structured.get("raw_text", ""),
         "summary": structured.get("summary", ""),
         "readinessScore": structured.get("readiness_score", 0.0),
         "readinessDimensions": structured.get("readiness_dimensions", {}),
@@ -61,11 +69,9 @@ async def create_material(
         rec = await db.get(UploadedFile, body.file_id)
         if not rec or rec.project_id != pid:
             raise HTTPException(404, "file not found")
-        try:
-            raw_content = open(rec.path, "r", encoding="utf-8", errors="replace").read()
-        except Exception:
-            raw_content = f"[无法读取文件内容：{rec.name}]"
-        source = RAW_PREFIX + raw_content
+        # 直接把文件路径交给解析管线，由 detect_type + extract_text 按真实类型抽取
+        # （md/txt/pdf/docx/图片OCR/链接均支持）；不再当纯文本直读字节，避免 PDF/Word 乱码。
+        source = rec.path
         title = body.title or rec.name
         # 更新文件状态为 parsing
         rec.status = "parsing"
@@ -92,13 +98,37 @@ async def create_material(
         rec.status = "parsed"
         rec.parsed_artifact_id = str(art.id)
 
+    # scope：crd_ref/prd_ref = 需求阶段专用参考资料（不进资料库，见 list 过滤）
+    extra = {**(art.extra or {}), "scope": body.scope}
+
+    # 需求阶段上传的参考资料（scope=crd_ref，asReference）：立即可用——直接定稿 + 内容解析完成。
+    # 资料阶段上传（scope=material）：两阶段独立定稿，asReference 不再自动置 content_parsed（问题6）。
+    if body.asReference and body.scope != "material":
+        art.status = "finalized"
+        extra["content_parsed"] = True
+    art.extra = extra
+
     await db.commit()
     await publish(pid, "artifact.created", {"artifact_url": str(art.id), "kind": "material_parsed"})
-    return ok(_flatten(structured, str(art.id), title, status=art.status))
+    return ok(
+        _flatten(
+            structured,
+            str(art.id),
+            title,
+            status=art.status,
+            content_parsed=bool((art.extra or {}).get("content_parsed")),
+        )
+    )
 
 
 @router.get("/projects/{pid}/materials")
-async def list_materials(pid: str, db: AsyncSession = Depends(get_db), _=Depends(require_auth)):
+async def list_materials(
+    pid: str,
+    scope: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_auth),
+):
+    """资料列表。scope 不传=资料阶段（仅 material，含旧数据无 scope）；scope=crd_ref 取需求阶段专用参考。"""
     arts = (
         await db.execute(
             select(Artifact)
@@ -112,6 +142,13 @@ async def list_materials(pid: str, db: AsyncSession = Depends(get_db), _=Depends
     ).scalars().all()
     out = []
     for a in arts:
+        a_scope = (a.extra or {}).get("scope", "material")
+        if scope is None:
+            # 资料阶段：排除需求阶段专用参考（crd_ref/prd_ref）
+            if a_scope != "material":
+                continue
+        elif a_scope != scope:
+            continue
         v = (
             await db.execute(
                 select(ArtifactVersion)
@@ -124,7 +161,15 @@ async def list_materials(pid: str, db: AsyncSession = Depends(get_db), _=Depends
             structured = json.loads(v.content) if v and v.content else {}
         except Exception:
             structured = {}
-        out.append(_flatten(structured, str(a.id), a.title, status=a.status))
+        out.append(
+            _flatten(
+                structured,
+                str(a.id),
+                a.title,
+                status=a.status,
+                content_parsed=bool((a.extra or {}).get("content_parsed")),
+            )
+        )
     return paged(out)
 
 
@@ -188,5 +233,54 @@ async def transform_material(
         )
     )
     a.current_version, a.version = nv, a.version + 1
+    # 注意（问题6）：transform 只产出新版本内容，**不再自动置 content_parsed**。
+    # 内容解析定稿需用户显式调用 /finalize-content（两阶段独立定稿）。
     await db.commit()
     return ok({"version": nv, "content": new_content})
+
+
+@router.post("/projects/{pid}/materials/{mid}/finalize-content")
+async def finalize_content_material(
+    pid: str, mid: str, db: AsyncSession = Depends(get_db), _=Depends(require_auth)
+):
+    """内容解析定稿（问题6）：显式置 extra.content_parsed=true，与文件解析定稿(status)独立。"""
+    a = await db.get(Artifact, mid)
+    if not a or a.project_id != pid or a.type != "material_parsed":
+        raise HTTPException(404, "material not found")
+    a.extra = {**(a.extra or {}), "content_parsed": True}
+    await db.commit()
+    return ok({"id": mid, "contentParsed": True})
+
+
+@router.delete("/projects/{pid}/materials/{mid}")
+async def delete_material(
+    pid: str, mid: str, db: AsyncSession = Depends(get_db), _=Depends(require_auth)
+):
+    """删除已解析资料（问题5/7）：归档 artifact + 删关联上传文件记录与物理文件。
+
+    两个 Tab 共用 materials 列表，删除后均同步消失。
+    """
+    from pathlib import Path
+
+    a = await db.get(Artifact, mid)
+    if not a or a.project_id != pid or a.type != "material_parsed":
+        raise HTTPException(404, "material not found")
+    # 反查关联上传文件（parsed_artifact_id == mid），删记录 + 物理文件
+    files = (
+        await db.execute(
+            select(UploadedFile).where(
+                UploadedFile.project_id == pid,
+                UploadedFile.parsed_artifact_id == mid,
+            )
+        )
+    ).scalars().all()
+    for rec in files:
+        try:
+            Path(rec.path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        await db.delete(rec)
+    # 归档 artifact（列表已按 archived_at is None 过滤，归档即消失）
+    a.archived_at = func.now()
+    await db.commit()
+    return ok({"deleted": True})

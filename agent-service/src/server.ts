@@ -37,18 +37,42 @@ const manager = new AgentManager();
 app.get("/v1/health", async () => ok({ status: "ok" }));
 
 app.post("/v1/structure", async (req) => {
-  const { text, session_id } = z
-    .object({ text: z.string(), session_id: z.string().nullish() })
+  const { text, session_id, prompt_override } = z
+    .object({
+      text: z.string(),
+      session_id: z.string().nullish(),
+      prompt_override: z.string().nullish(),
+    })
     .parse(req.body);
-  return ok(await manager.runStructure(text, session_id ?? undefined));
+  return ok(
+    await manager.runStructure(text, session_id ?? undefined, prompt_override ?? undefined),
+  );
 });
 
 app.post("/v1/requirement", async (req) => {
-  const { kind, upstream, session_id } = z
-    .object({ kind: z.string(), upstream: z.string(), session_id: z.string().nullish() })
+  const { kind, upstream, session_id, prompt_override } = z
+    .object({
+      kind: z.string(),
+      upstream: z.string(),
+      session_id: z.string().nullish(),
+      prompt_override: z.string().nullish(),
+    })
     .parse(req.body);
-  const markdown = await manager.runRequirement(kind, upstream, session_id ?? undefined);
+  const markdown = await manager.runRequirement(
+    kind,
+    upstream,
+    session_id ?? undefined,
+    prompt_override ?? undefined,
+  );
   return ok({ markdown });
+});
+
+app.post("/v1/beautify", async (req) => {
+  const { draft, session_id } = z
+    .object({ draft: z.string(), session_id: z.string().nullish() })
+    .parse(req.body);
+  const content = await manager.runBeautify(draft, session_id ?? undefined);
+  return ok({ content });
 });
 
 app.post("/v1/sessions", async (req) => {
@@ -102,6 +126,31 @@ app.get<{ Params: { id: string } }>("/v1/sessions/:id", { websocket: true }, (so
       return;
     }
     if (msg.type === "message" && typeof msg.content === "string") session.post(msg.content);
+    if (
+      msg.type === "generate" &&
+      typeof msg.kind === "string" &&
+      typeof msg.upstream === "string"
+    ) {
+      session.postGenerate(
+        msg.kind,
+        msg.upstream,
+        typeof msg.systemPrompt === "string" ? msg.systemPrompt : undefined,
+      );
+    }
+    if (
+      msg.type === "edit" &&
+      typeof msg.currentDoc === "string" &&
+      typeof msg.instruction === "string"
+    ) {
+      session.postEdit(
+        msg.currentDoc,
+        msg.instruction,
+        typeof msg.systemPrompt === "string" ? msg.systemPrompt : undefined,
+      );
+    }
+    if (msg.type === "beautify" && typeof msg.draft === "string") {
+      session.postBeautify(msg.draft);
+    }
     if (msg.type === "hitl") session.resolveHitl(msg);
   });
   socket.on("close", () => unsub());

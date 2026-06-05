@@ -70,6 +70,10 @@ class MaterialIn(BaseModel):
     title: str | None = None
     isText: bool = False
     file_id: str | None = None  # T-BE-01：已上传文件 ID
+    # 「无需修改的参考资料」（上传 .md）：直接视为内容解析定稿，可立即作为参考资料
+    asReference: bool = False
+    # scope：material=资料阶段（默认）；crd_ref/prd_ref=需求阶段上传的专用参考资料，不进资料库
+    scope: str = "material"
 
 
 class DelegateIn(BaseModel):

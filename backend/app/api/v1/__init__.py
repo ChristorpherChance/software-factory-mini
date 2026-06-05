@@ -18,6 +18,7 @@ from . import (
     files,
     internal,
     capability,
+    agent_prompts,
 )
 
 router = APIRouter()
@@ -38,5 +39,6 @@ for _m in (
     files,
     internal,
     capability,
+    agent_prompts,
 ):
     router.include_router(_m.router)

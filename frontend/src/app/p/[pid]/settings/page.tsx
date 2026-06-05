@@ -8,9 +8,11 @@ import { ScrollText } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { AgentPromptsTab } from "./AgentPromptsTab";
 
-const CATS = ["model", "hitl", "kb", "sandbox", "endpoint", "general"] as const;
+const CATS = ["agents", "model", "hitl", "kb", "sandbox", "endpoint", "general"] as const;
 const LABEL: Record<string, string> = {
+  agents: "Agent 配置",
   model: "模型",
   hitl: "HITL",
   kb: "知识库",
@@ -21,7 +23,7 @@ const LABEL: Record<string, string> = {
 
 export default function SettingsPage() {
   const { pid } = useParams<{ pid: string }>();
-  const [tab, setTab] = useState<(typeof CATS)[number]>("model");
+  const [tab, setTab] = useState<(typeof CATS)[number]>("agents");
 
   const { data: cfg } = useQuery({
     queryKey: ["settings", pid],
@@ -55,7 +57,9 @@ export default function SettingsPage() {
       </nav>
 
       <section className="flex-1">
-        {tab === "endpoint" ? (
+        {tab === "agents" ? (
+          <AgentPromptsTab pid={pid} />
+        ) : tab === "endpoint" ? (
           <EndpointsTab pid={pid} />
         ) : (
           <KvTab cat={tab} cfg={(cfg?.[tab] as Record<string, any>) ?? {}} />
