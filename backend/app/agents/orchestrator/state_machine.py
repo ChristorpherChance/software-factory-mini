@@ -17,10 +17,20 @@ import re
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ...models.entities import Session, Artifact, ArtifactVersion, PendingChange
+from ...models.entities import (
+    Session,
+    Artifact,
+    ArtifactVersion,
+    PendingChange,
+    Task,
+    SessionSettingOverride,
+)
 from ...core.events import publish
 from ...core.prompt_ctx import set_active_prompts
+from ...core.model_ctx import set_active_model
+from ...core.llm import edit_requirement, chat_reply
 from ...services.prompt_resolve import load_active_prompts
+from ...services.settings import resolve_llm_endpoint
 from ..material.pipeline import parse_material
 from ..requirement.generator import generate, extract_nodes
 
@@ -136,6 +146,9 @@ class Orchestrator:
         user_text: str,
         hitl_mode: str | None = None,
         references: list[str] | None = None,
+        target_type: str | None = None,
+        target_artifact_id: str | None = None,
+        quote: str | None = None,
     ):
         pid, sess_hitl, _ = await self._project_and_hitl(session_id)
         hitl = hitl_mode or sess_hitl
@@ -144,7 +157,15 @@ class Orchestrator:
             set_active_prompts(await load_active_prompts(self.db))
         except Exception:
             pass
+        # 注入会话级模型选择（问题2）：ModelPicker 经 api.putOverride 写 model.name → 解析出端点。
+        try:
+            await self._inject_active_model(pid, session_id)
+        except Exception:
+            set_active_model(None)  # 失败忽略，走默认 provider 分流
         intent = self._route(user_text)
+        # 划选引用（问题3）：有引用片段则强制按定向编辑处理（parse_material 除外）。
+        if quote and quote.strip() and intent != "parse_material":
+            intent = "edit"
 
         if intent == "parse_material":
             yield "开始解析资料…\n"
@@ -156,21 +177,191 @@ class Orchestrator:
                 yield "\n缺口：" + "、".join(result["missing_items"])
             return
 
-        if intent in ("ord", "crd", "prd"):
-            yield f"生成 {intent.upper()} 中…\n"
+        # 对话定向编辑（问题5）：只改指定条目 → 切块 → 建 pending（不整篇覆盖）。
+        if intent == "edit":
+            kind = (target_type or "crd").lower()
+            if kind not in ("crd", "prd", "ord"):
+                kind = "crd"
+            from ...services.artifact_helpers import latest_content
+
+            old_md = await latest_content(self.db, pid, kind) if pid else ""
+            if not (old_md or "").strip():
+                yield f"当前「{kind.upper()}」还没有可编辑的文档，请先生成后再修改。"
+                return
+            prompt_override = None
+            try:
+                prompt_override = (await load_active_prompts(self.db)).get(f"requirement.{kind}")
+            except Exception:
+                prompt_override = None
+            new_md = await edit_requirement(old_md, user_text, prompt_override, quote)
+            if new_md == old_md:
+                yield "未能定位到要修改的位置：请指明具体章节/编号（如 CR-003）或换种说法。"
+                return
+            pc = await self._save_edit_pending(
+                pid, kind, target_artifact_id, old_md, new_md, session_id, hitl
+            )
+            n = len(pc.diff_blocks) if (pc and pc.diff_blocks) else len(_to_diff_blocks_update(old_md, new_md))
+            yield f"已在「{kind.upper()}」中定位并生成 {n} 处改动，请在主区逐块确认（不会整篇覆盖原文）。"
+            return
+
+        if intent in ("ord", "crd", "prd", "gen"):
+            # "gen"=有生成动词但未点名类型：按当前主区工件类型生成（回落 crd）。
+            kind = intent if intent in ("ord", "crd", "prd") else (target_type or "crd").lower()
+            if kind not in ("ord", "crd", "prd"):
+                kind = "crd"
+            yield f"生成 {kind.upper()} 中…\n"
+            # 自动拆解子步骤任务（问题3），过程中推进，前端 Task 进度区可见
+            steps = await self._auto_decompose_tasks(pid, kind, session_id) if pid else []
+            await self._advance_task(pid, session_id, steps, 0)  # 1 收集上游与参考资料
             upstream_md = (
-                await self._build_generation_upstream(pid, intent, references)
+                await self._build_generation_upstream(pid, kind, references)
                 if pid
                 else user_text
             )
-            doc = await generate(intent, upstream_md or user_text, session_id=session_id)
-            for chunk in _chunks(doc["markdown"], 60):
+            await self._advance_task(pid, session_id, steps, 1)  # 2 规划章节大纲
+            await self._advance_task(pid, session_id, steps, 2)  # 3 逐条产出需求项
+            doc = await generate(kind, upstream_md or user_text, session_id=session_id)
+            # 大文档分块：用较大块（400）减少 SSE 事件数，避免前端被上千次增量压垮（卡死修复）。
+            for chunk in _chunks(doc["markdown"], 400):
                 yield chunk
+            await self._advance_task(pid, session_id, steps, 3)  # 4 抽取追溯边(RTM)
             if pid:
-                await self._save_requirement(pid, intent, doc, session_id, hitl)
+                await self._save_requirement(pid, kind, doc, session_id, hitl)
+            await self._advance_task(pid, session_id, steps, 4)  # 5 自检覆盖率
+            # 生成完成即清除步骤任务（问题6：仅生成中显示，完成后清除）。
+            await self._clear_step_tasks(pid, kind, steps)
             return
 
-        yield "已收到。可上传/粘贴资料触发解析，或说明要生成的文档类型（ORD/CRD/PRD）。"
+        # 默认：对话（问题3）。不重写文档；配置了真实模型则对话式回答，否则给出明确指引。
+        ctx = ""
+        if pid and target_type:
+            try:
+                from ...services.artifact_helpers import latest_content
+
+                ctx = await latest_content(self.db, pid, (target_type or "").lower())
+            except Exception:
+                ctx = ""
+        yield await chat_reply(user_text, ctx)
+
+    # ---- 会话级模型选择（问题2）----
+    async def _inject_active_model(self, pid, session_id):
+        """读会话级 model.name 覆盖 → resolve 出端点 dict 注入 contextvar。"""
+        if not pid:
+            set_active_model(None)
+            return
+        ov = (
+            await self.db.execute(
+                select(SessionSettingOverride).where(
+                    SessionSettingOverride.session_id == session_id,
+                    SessionSettingOverride.category == "model",
+                    SessionSettingOverride.key == "name",
+                )
+            )
+        ).scalars().first()
+        name = None
+        if ov and ov.value:
+            # value 可能是裸字符串或 {"name": ...} 形态，做宽松解析
+            name = ov.value if isinstance(ov.value, str) else (ov.value.get("name") if isinstance(ov.value, dict) else None)
+        if not name:
+            set_active_model(None)
+            return
+        ep = await resolve_llm_endpoint(self.db, pid, name)
+        set_active_model(ep)
+
+    # ---- Agent 自动拆解任务（问题3）----
+    async def _auto_decompose_tasks(self, pid, kind, session_id) -> list[str]:
+        """把本次生成拆成 5 条真实子步骤任务；先清理历史同类步骤再建，返回 task id 列表。
+
+        失败不抛（生成不应因任务拆解失败而中断）。"""
+        try:
+            prefix = f"{kind.upper()}-STEP"
+            old = (
+                await self.db.execute(
+                    select(Task).where(Task.project_id == pid, Task.code.like(f"{prefix}-%"))
+                )
+            ).scalars().all()
+            for t in old:
+                await self.db.delete(t)
+            if old:
+                await self.db.commit()
+            step_titles = [
+                "收集上游与参考资料",
+                "规划章节大纲",
+                "逐条产出需求项",
+                "抽取追溯边(RTM)",
+                "自检覆盖率",
+            ]
+            tasks: list[Task] = []
+            for i, title in enumerate(step_titles, 1):
+                t = Task(
+                    project_id=pid,
+                    code=f"{prefix}-{i}",
+                    title=title,
+                    stage="requirement",
+                    status="todo",
+                )
+                self.db.add(t)
+                tasks.append(t)
+            await self.db.commit()
+            for t in tasks:
+                await self.db.refresh(t)
+            return [str(t.id) for t in tasks]
+        except Exception:
+            return []
+
+    async def _advance_task(self, pid, session_id, task_ids: list[str], idx: int):
+        """推进第 idx 个步骤任务：todo→in_progress→done，并 publish task.update（channel=pid）。
+
+        失败不抛（务实推进，缺一步也不影响生成）。"""
+        if not task_ids or idx >= len(task_ids) or not pid:
+            return
+        try:
+            tid = task_ids[idx]
+            t = await self.db.get(Task, tid)
+            if not t:
+                return
+            t.status = "in_progress"
+            await self.db.commit()
+            await publish(str(pid), "task.update", {"task_id": tid, "status": "in_progress"})
+            t.status = "done"
+            await self.db.commit()
+            await publish(str(pid), "task.update", {"task_id": tid, "status": "done"})
+        except Exception:
+            pass
+
+    async def _clear_step_tasks(self, pid, kind, task_ids: list[str]):
+        """生成完成后清除本次拆解的步骤任务（问题6）：按 id（回落 code 前缀）删除。
+
+        删除后对每个任务再 publish 一条 task.update（status=done），促前端失效并重拉
+        tasks 查询，发现已无步骤任务即隐藏 Task 区。失败不抛（不影响生成结果）。"""
+        if not pid:
+            return
+        try:
+            removed: list[str] = []
+            # 优先按本次返回的 id 删；id 为空（拆解失败）时回落 code 前缀兜底清理。
+            if task_ids:
+                for tid in task_ids:
+                    t = await self.db.get(Task, tid)
+                    if t:
+                        await self.db.delete(t)
+                        removed.append(tid)
+            else:
+                prefix = f"{kind.upper()}-STEP"
+                rows = (
+                    await self.db.execute(
+                        select(Task).where(
+                            Task.project_id == pid, Task.code.like(f"{prefix}-%")
+                        )
+                    )
+                ).scalars().all()
+                for t in rows:
+                    removed.append(str(t.id))
+                    await self.db.delete(t)
+            await self.db.commit()
+            for tid in removed:
+                await publish(str(pid), "task.update", {"task_id": tid, "status": "done"})
+        except Exception:
+            pass
 
     # ---- 落库 ----
     async def _save_material(self, pid, source, result, session_id):
@@ -270,12 +461,40 @@ class Orchestrator:
             body = f"# 参考资料\n{refs}" if refs.strip() else ""
             return (head + body).strip()
         if kind == "prd":
-            crd_md = await latest_content(self.db, pid, "crd")
-            head = f"# 上游 CRD\n{crd_md}\n\n" if crd_md.strip() else ""
-            body = f"# 参考资料\n{refs}" if refs.strip() else ""
+            # 问题6：优先取「已定稿」CRD 作上游；无定稿则回落最新 CRD 并注明（未定稿）。
+            crd_md, finalized = await self._finalized_or_latest(pid, "crd")
+            note = "" if finalized else "（未定稿）"
+            head = f"# 上游 CRD{note}\n{crd_md}\n\n" if crd_md.strip() else ""
+            # 问题1：PRD 默认只以 CRD 为参考，不自动带入前面所有资料；
+            # 仅当用户在参考资料栏「显式勾选」了资料（references 非空）时才附带。
+            prd_refs = refs if references else ""
+            body = f"# 参考资料\n{prd_refs}" if prd_refs.strip() else ""
             return (head + body).strip()
         # ord：资料即上游（回落到旧的 summary/key_points 拼装）
         return refs.strip() or await self._upstream_md(pid, "ord")
+
+    async def _finalized_or_latest(self, pid, doc_type) -> tuple[str, bool]:
+        """优先取「已定稿」工件的最新版本内容（问题6）；无定稿则回落最新工件。
+
+        返回 (content, is_finalized)。"""
+        from ...services.artifact_helpers import latest_version, latest_content
+
+        q = (
+            select(Artifact)
+            .where(
+                Artifact.project_id == pid,
+                Artifact.type == doc_type,
+                Artifact.status == "finalized",
+                Artifact.archived_at.is_(None),
+            )
+            .order_by(Artifact.created_at.desc())
+            .limit(1)
+        )
+        art = (await self.db.execute(q)).scalars().first()
+        if art:
+            v = await latest_version(self.db, art.id)
+            return ((v.content if v else "") or "", True)
+        return (await latest_content(self.db, pid, doc_type), False)
 
     async def _save_requirement(self, pid, kind, doc, session_id, hitl):
         from ...services.rtm import add_edges, add_nodes
@@ -383,13 +602,17 @@ class Orchestrator:
             return "parse_material"
         if t.startswith("raw_text:") or "解析资料" in text or "解析这" in text:
             return "parse_material"
-        # 编辑意图（问题2）：对话=局部改。含修改动词 → 定向编辑当前文档（不整篇重生成）。
-        # 注意：必须在 ord/crd/prd 贪心匹配之前，否则「把 CR-003 改成…」会被当成整篇生成 CRD。
+        # 问题3：仅当出现明确「生成/重新生成」动词时，才触发整篇生成；
+        # 仅"提及" crd/prd（如提问/闲聊）绝不重写——否则用户每发一句都被整篇重写。
+        if any(g in text for g in self._GEN_VERBS):
+            for k in ("prd", "crd", "ord"):
+                if k in t:
+                    return k
+            return "gen"  # 有生成动词但未点名类型 → 由 handle 按当前主区工件类型决定
+        # 含修改动词（且无生成动词）→ 定向编辑当前文档（局部改，不整篇重生成）。
         if self._is_edit_intent(text):
             return "edit"
-        for k in ("prd", "crd", "ord"):
-            if k in t:
-                return k
+        # 其余（含仅提及 crd/prd 的提问/讨论）→ 对话，绝不整篇重写。
         return "chat"
 
     # 修改动词（编辑意图）；命中且非「生成/重新生成」整篇指令时视为定向编辑

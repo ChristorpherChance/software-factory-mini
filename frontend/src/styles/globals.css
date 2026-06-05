@@ -116,9 +116,193 @@
     background: transparent;
   }
 
+  /*
+   * 手写 .prose 排版规则（本项目未安装 @tailwindcss/typography 插件）。
+   * Tailwind 的 preflight 把 h1-h6/p 的字号·字重·外边距全部清零，导致 Markdown
+   * 渲染后标题与正文挤成一团、互相重叠。这里离线、确定性地补齐排版，颜色均用
+   * var(--token)，暗色模式下随 token 自动切换，无需额外写 dark 规则。
+   */
+  .prose {
+    color: var(--text);
+    line-height: 1.7;
+    font-size: 14px;
+    word-break: break-word;
+  }
+  .prose > :first-child {
+    margin-top: 0;
+  }
+  .prose > :last-child {
+    margin-bottom: 0;
+  }
+
+  /* 标题：递减字号 + 上间距大于下间距 + scroll-margin 配合 TOC 锚点滚动 */
+  .prose h1,
+  .prose h2,
+  .prose h3,
+  .prose h4,
+  .prose h5,
+  .prose h6 {
+    color: var(--text);
+    font-weight: 700;
+    line-height: 1.3;
+    scroll-margin-top: 8px;
+  }
+  .prose h1 {
+    font-size: 1.6em;
+    margin: 1.4em 0 0.6em;
+  }
+  .prose h2 {
+    font-size: 1.35em;
+    margin: 1.3em 0 0.55em;
+    padding-bottom: 0.3em;
+    border-bottom: 1px solid var(--border);
+  }
+  .prose h3 {
+    font-size: 1.18em;
+    margin: 1.2em 0 0.5em;
+  }
+  .prose h4 {
+    font-size: 1.05em;
+    font-weight: 600;
+    margin: 1.1em 0 0.45em;
+  }
+  .prose h5 {
+    font-size: 1em;
+    font-weight: 600;
+    margin: 1em 0 0.4em;
+  }
+  .prose h6 {
+    font-size: 0.9em;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin: 1em 0 0.4em;
+  }
+
+  /* 正文段落与列表 */
+  .prose p {
+    margin: 0.75em 0;
+  }
+  .prose ul,
+  .prose ol {
+    margin: 0.75em 0;
+    padding-left: 1.5em;
+  }
+  .prose ul {
+    list-style: disc;
+  }
+  .prose ol {
+    list-style: decimal;
+  }
+  .prose li {
+    margin: 0.3em 0;
+  }
+  /* 嵌套列表收紧 */
+  .prose li > ul,
+  .prose li > ol {
+    margin: 0.3em 0;
+  }
+
+  /* 引用块：左边框 + 次要色 + 斜体缩进 */
+  .prose blockquote {
+    margin: 0.9em 0;
+    padding: 0.2em 0 0.2em 1em;
+    border-left: 3px solid var(--border);
+    color: var(--text-secondary);
+    font-style: italic;
+  }
+  .prose blockquote > :first-child {
+    margin-top: 0;
+  }
+  .prose blockquote > :last-child {
+    margin-bottom: 0;
+  }
+
+  /* 行内 code：浅底 + 圆角 + 等宽 */
+  .prose code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.875em;
+    background: var(--bg-subtle);
+    padding: 0.15em 0.4em;
+    border-radius: var(--radius-sm);
+  }
+  /* 代码块：bg-subtle + 内边距 + 圆角 + 横向滚动不换行 */
+  .prose pre {
+    margin: 0.9em 0;
+    padding: 0.85em 1em;
+    background: var(--bg-subtle);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    overflow-x: auto;
+    line-height: 1.5;
+  }
+  .prose pre code {
+    background: transparent;
+    padding: 0;
+    border-radius: 0;
+    font-size: 0.85em;
+    white-space: pre;
+  }
+
+  /* 链接 / 强调 / 分隔线 / 图片 */
+  .prose a {
+    color: var(--primary);
+    text-decoration: none;
+  }
+  .prose a:hover {
+    text-decoration: underline;
+  }
+  .prose strong {
+    font-weight: 700;
+    color: var(--text);
+  }
+  .prose em {
+    font-style: italic;
+  }
+  .prose hr {
+    margin: 1.4em 0;
+    border: 0;
+    border-top: 1px solid var(--border);
+  }
+  .prose img {
+    max-width: 100%;
+    height: auto;
+    border-radius: var(--radius-sm);
+  }
+
+  /* .prose-sm：整体字号略小、间距相应收紧（很多地方用 prose prose-sm） */
+  .prose-sm {
+    font-size: 13px;
+    line-height: 1.65;
+  }
+  .prose-sm h1 {
+    margin: 1.2em 0 0.5em;
+  }
+  .prose-sm h2 {
+    margin: 1.1em 0 0.45em;
+  }
+  .prose-sm h3,
+  .prose-sm h4,
+  .prose-sm h5,
+  .prose-sm h6 {
+    margin: 1em 0 0.4em;
+  }
+  .prose-sm p,
+  .prose-sm ul,
+  .prose-sm ol {
+    margin: 0.6em 0;
+  }
+  .prose-sm li {
+    margin: 0.25em 0;
+  }
+  .prose-sm pre,
+  .prose-sm blockquote {
+    margin: 0.7em 0;
+  }
+
   /* GFM 表格边框（remark-gfm 渲染的 md 表格；Tailwind prose 默认无边框，复杂表格观感错位） */
   .prose table {
     width: 100%;
+    margin: 0.9em 0;
     border-collapse: collapse;
     display: table;
     overflow-x: auto;

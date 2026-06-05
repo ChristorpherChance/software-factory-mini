@@ -251,6 +251,8 @@ export interface EndpointDto {
   model?: string;
   hasKey: boolean;
   enabled: boolean;
+  /** 供应商标识（OpenAI/DeepSeek/…）；后端来自 extra.provider，可能为 null。 */
+  provider?: string;
 }
 
 export interface SettingAuditDto {
@@ -296,15 +298,31 @@ export const api = {
       method: "POST",
       body: JSON.stringify(b),
     }),
+  /** 重命名会话（PATCH body {title}）。 */
+  renameSession: (sid: string, title: string) =>
+    req<SessionDto>(`/sessions/${sid}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title }),
+    }),
+  /** 删除会话（后端软删除/归档，置 archived_at；列表自动隐藏）。 */
+  deleteSession: (sid: string) =>
+    req<{ deleted: boolean }>(`/sessions/${sid}`, { method: "DELETE" }),
 
   // --- 消息 ---
   messages: (sid: string) => req<MessageDto[]>(`/sessions/${sid}/messages`),
+  /** 取消消息（置 status=cancelled；本地编排循环据此协作式停下）。 */
+  cancelMessage: (sid: string, mid: string) =>
+    req<{ cancelled: boolean }>(`/sessions/${sid}/messages/${mid}/cancel`, {
+      method: "POST",
+    }),
   send: (
     sid: string,
     content: string,
     hitlMode: string,
     references?: string[],
-    target?: { targetType?: string | null; targetArtifactId?: string | null }
+    target?: { targetType?: string | null; targetArtifactId?: string | null },
+    // 划选引用片段（问题3）：非空时后端据此把意图视为定向编辑，仅改该片段
+    quote?: string
   ) =>
     req<MessageDto>(`/sessions/${sid}/messages`, {
       method: "POST",
@@ -316,6 +334,7 @@ export const api = {
         ...(references && references.length ? { references } : {}),
         ...(target?.targetType ? { targetType: target.targetType } : {}),
         ...(target?.targetArtifactId ? { targetArtifactId: target.targetArtifactId } : {}),
+        ...(quote ? { quote } : {}),
       }),
     }),
 
@@ -402,6 +421,18 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ toVersion }),
     }),
+  /** 工件定稿（status → finalized，version+1，并 publish artifact.created）。 */
+  finalizeArtifact: (pid: string, aid: string) =>
+    req<{ id: string; status: string }>(
+      `/projects/${pid}/artifacts/${aid}/finalize`,
+      { method: "POST" }
+    ),
+  /** 解锁定稿（status 置回 draft，version+1，try publish artifact.created）。 */
+  unfinalizeArtifact: (pid: string, aid: string) =>
+    req<{ id: string; status: string }>(
+      `/projects/${pid}/artifacts/${aid}/unfinalize`,
+      { method: "POST" }
+    ),
   /** 设置 CRD/PRD 参考资料关联（写入 artifact.extra.references）。 */
   setReferences: (pid: string, aid: string, materialIds: string[]) =>
     req<{ id: string; references: string[] }>(
@@ -440,6 +471,8 @@ export const api = {
   // --- 待定变更 ---
   pendingChanges: (pid: string, status = "pending") =>
     req<PendingChangeDto[]>(`/projects/${pid}/pending-changes?status=${status}`),
+  /** 单条待定变更（含最新 diffBlocks/status）；用于对话区与主区确认状态实时联动。 */
+  pendingChange: (cid: string) => req<PendingChangeDto>(`/pending-changes/${cid}`),
   approve: (cid: string) =>
     req<{ approved: boolean }>(`/pending-changes/${cid}/approve`, { method: "POST" }),
   reject: (cid: string, reason: string) =>
@@ -517,11 +550,31 @@ export const api = {
   endpoints: (pid: string) => req<EndpointDto[]>(`/projects/${pid}/endpoints`),
   createEndpoint: (
     pid: string,
-    b: { kind: string; name: string; baseUrl?: string; model?: string; apiKey?: string }
+    b: {
+      kind: string;
+      name: string;
+      baseUrl?: string;
+      model?: string;
+      apiKey?: string;
+      provider?: string;
+    }
   ) =>
     req<{ id: string; name: string }>(`/projects/${pid}/endpoints`, {
       method: "POST",
-      body: JSON.stringify(b),
+      // provider 经 extra 透传给后端（仅当有值），其余字段平铺
+      body: JSON.stringify({
+        kind: b.kind,
+        name: b.name,
+        baseUrl: b.baseUrl,
+        model: b.model,
+        apiKey: b.apiKey,
+        ...(b.provider ? { extra: { provider: b.provider } } : {}),
+      }),
+    }),
+  /** 删除端点。 */
+  deleteEndpoint: (pid: string, eid: string) =>
+    req<{ deleted: boolean }>(`/projects/${pid}/endpoints/${eid}`, {
+      method: "DELETE",
     }),
   testEndpoint: (pid: string, eid: string) =>
     req<{ reachable: boolean; status?: number; error?: string }>(

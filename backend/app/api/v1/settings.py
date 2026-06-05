@@ -64,10 +64,26 @@ async def list_endpoints(pid: str, db: AsyncSession = Depends(get_db), _=Depends
                 "model": e.model,
                 "hasKey": bool(e.api_key_cipher),
                 "enabled": e.enabled,
+                # provider（多模型切换需在前端展示/区分；可能为 null）
+                "provider": (e.extra or {}).get("provider"),
             }
             for e in rows
         ]
     )
+
+
+@router.delete("/projects/{pid}/endpoints/{eid}")
+async def delete_endpoint(pid: str, eid: str, db: AsyncSession = Depends(get_db), _=Depends(require_auth)):
+    """删除该 project 下的端点（问题2）；不存在也安全返回。"""
+    ep = (
+        await db.execute(
+            select(Endpoint).where(Endpoint.id == eid, Endpoint.project_id == pid)
+        )
+    ).scalars().first()
+    if ep:
+        await db.delete(ep)
+        await db.commit()
+    return ok({"deleted": True})
 
 
 @router.post("/projects/{pid}/endpoints/{eid}/test")

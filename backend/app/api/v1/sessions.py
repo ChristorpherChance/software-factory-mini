@@ -1,6 +1,6 @@
 """会话 Session & 子会话 API（S2 接口设计 §3）。"""
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...deps import require_auth
@@ -73,6 +73,18 @@ async def patch(sid: str, body: dict, db: AsyncSession = Depends(get_db), _=Depe
     await db.commit()
     await db.refresh(s)
     return ok(_dto(s))
+
+
+@router.delete("/sessions/{sid}")
+async def archive(sid: str, db: AsyncSession = Depends(get_db), _=Depends(require_auth)):
+    """会话软删除/归档（问题5）：置 archived_at；列表已过滤 archived_at.is_(None)。
+
+    不存在也安全返回 ok（与其它实体软删一致，幂等）。"""
+    s = await db.get(Session, sid)
+    if s:
+        s.archived_at = func.now()
+        await db.commit()
+    return ok({"deleted": True})
 
 
 @router.post("/sessions/{sid}/subsessions")

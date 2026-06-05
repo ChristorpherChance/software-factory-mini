@@ -1,14 +1,44 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef } from "react";
 import { useParams } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { api } from "@/lib/api";
 import { useSessionStore } from "@/stores/session";
 import { useToolCallStore } from "@/stores/toolcall";
 import { PendingActions } from "@/components/chat/PendingActions";
 import { ToolCallCard } from "@/components/chat/ToolCallCard";
 import { cn } from "@/lib/utils";
+
+// 助手消息气泡（性能关键：修复大文档生成时全页面卡死）。
+// - streaming 中：用纯文本渲染（whitespace-pre-wrap），避免每来一段增量就把
+//   不断变长的整篇 markdown 重新解析一次（O(n²) 主线程阻塞 → 卡死）。
+// - streaming 结束：用 ReactMarkdown 渲染一次；外层 memo 保证后续无关重渲染
+//   （如 pending 轮询每 4s）不再重复解析整篇。
+const AssistantBubble = memo(function AssistantBubble({
+  content,
+  streaming,
+}: {
+  content: string;
+  streaming?: boolean;
+}) {
+  return (
+    <div className="inline-block max-w-[90%] rounded-lg bg-bg-subtle px-3 py-2 text-left">
+      {streaming ? (
+        <div className="whitespace-pre-wrap text-sm text-text">
+          {content}
+          <span className="ml-0.5 animate-pulse">▋</span>
+        </div>
+      ) : (
+        <article className="prose prose-sm max-w-none text-text">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+        </article>
+      )}
+    </div>
+  );
+});
 
 // 消息流：
 // - 历史消息：user / assistant + thinking 折叠（C 档）+ inline ToolCallCard（按 msg_id 关联）
@@ -49,15 +79,16 @@ export function MessageStream() {
         const calls = byMsg[m.id] ?? [];
         return (
           <div key={m.id} className={cn("space-y-2", isUser && "text-right")}>
-            <div
-              className={cn(
-                "inline-block max-w-[90%] whitespace-pre-wrap rounded-lg px-3 py-2 text-left text-sm",
-                isUser ? "bg-primary text-white" : "bg-bg-subtle text-text"
-              )}
-            >
-              {m.content}
-              {m.streaming && <span className="ml-0.5 animate-pulse">▋</span>}
-            </div>
+            {isUser ? (
+              // user 消息：纯文本气泡（保持简洁）
+              <div className="inline-block max-w-[90%] whitespace-pre-wrap rounded-lg bg-primary px-3 py-2 text-left text-sm text-white">
+                {m.content}
+                {m.streaming && <span className="ml-0.5 animate-pulse">▋</span>}
+              </div>
+            ) : (
+              // assistant 消息：流式中纯文本、完成后 Markdown（AssistantBubble 内部处理，避免大文档卡死）
+              <AssistantBubble content={m.content} streaming={m.streaming} />
+            )}
 
             {/* 思考过程折叠（thinking 非空才渲染 · C 档） */}
             {!isUser && m.thinking && (
