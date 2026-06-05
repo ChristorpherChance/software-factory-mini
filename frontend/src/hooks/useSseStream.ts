@@ -40,20 +40,29 @@ export function useSseStream(sid: string | null) {
     // 不会被 React 18 自动批处理 → 大文档可达上千次 setState/重渲染而卡死。
     // 用 requestAnimationFrame 把同一帧内的多段增量合并为一次 appendDelta。
     const deltaBuf = new Map<string, string>();
+    const thinkBuf = new Map<string, string>(); // channel=reasoning 的思考链增量
     let rafId = 0;
     const flushDeltas = () => {
       rafId = 0;
-      if (deltaBuf.size === 0) return;
-      const entries = Array.from(deltaBuf.entries());
-      deltaBuf.clear();
-      for (const [id, txt] of entries) sess.appendDelta(id, txt);
+      if (deltaBuf.size > 0) {
+        const entries = Array.from(deltaBuf.entries());
+        deltaBuf.clear();
+        for (const [id, txt] of entries) sess.appendDelta(id, txt);
+      }
+      if (thinkBuf.size > 0) {
+        const entries = Array.from(thinkBuf.entries());
+        thinkBuf.clear();
+        for (const [id, txt] of entries) sess.appendThinking(id, txt);
+      }
     };
 
     const route = (type: string, data: any) => {
       switch (type) {
         case "message.delta": {
           const id = data.msg_id;
-          deltaBuf.set(id, (deltaBuf.get(id) ?? "") + (data.delta ?? ""));
+          // 思考链(channel=reasoning) 进 thinkBuf → 折叠「🤔 思考」区；正文进 deltaBuf
+          const buf = data.channel === "reasoning" ? thinkBuf : deltaBuf;
+          buf.set(id, (buf.get(id) ?? "") + (data.delta ?? ""));
           if (typeof requestAnimationFrame === "undefined") {
             flushDeltas(); // 极端兜底：无 rAF 环境直接刷新
           } else if (!rafId) {

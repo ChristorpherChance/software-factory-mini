@@ -27,15 +27,28 @@ from ...models.entities import (
 )
 from ...core.events import publish
 from ...core.prompt_ctx import set_active_prompts
-from ...core.model_ctx import set_active_model
-from ...core.llm import edit_requirement, chat_reply
+from ...core.model_ctx import set_active_model, get_active_model
+from ...core.llm import (
+    edit_requirement,
+    chat_reply,
+    chat_reply_stream,
+    generate_requirement_stream,
+)
 from ...services.prompt_resolve import load_active_prompts
 from ...services.settings import resolve_llm_endpoint
 from ..material.pipeline import parse_material
-from ..requirement.generator import generate, extract_nodes
+from ..requirement.generator import generate, extract_nodes, extract_edges
 
 UPSTREAM = {"ord": None, "crd": "ord", "prd": "crd"}
 LAYER = {"ord": "ORD", "crd": "CRD", "prd": "PRD"}
+
+
+def _openai_active() -> bool:
+    """会话级 active model 是否为 OpenAI 兼容端点（有 base_url 且 provider 非 pi/stub/anthropic）。
+
+    成立时走 _openai_chat_stream 真 token 流式（Ollama/DeepSeek/qwen）。"""
+    m = get_active_model()
+    return bool(m and m.get("base_url") and m.get("provider") not in (None, "stub", "anthropic"))
 
 
 # ---- DiffBlock 切块 ----
@@ -220,10 +233,22 @@ class Orchestrator:
             )
             await self._advance_task(pid, session_id, steps, 1)  # 2 规划章节大纲
             await self._advance_task(pid, session_id, steps, 2)  # 3 逐条产出需求项
-            doc = await generate(kind, upstream_md or user_text, session_id=session_id)
-            # 大文档分块：用较大块（400）减少 SSE 事件数，避免前端被上千次增量压垮（卡死修复）。
-            for chunk in _chunks(doc["markdown"], 400):
-                yield chunk
+            if _openai_active():
+                # 本地/OpenAI 兼容端点：逐 token 真流式。推理模型(Qwen3/R1)的思考链单独走
+                # ("reasoning", text) 元组 → 前端收进折叠「🤔 思考」区；正文(content)进对话气泡+落库文档。
+                buf = ""
+                async for chn, d in generate_requirement_stream(kind, upstream_md or user_text):
+                    if chn == "reasoning":
+                        yield ("reasoning", d)
+                    else:
+                        buf += d
+                        yield d
+                doc = {"kind": kind, "markdown": buf, "edges": extract_edges(buf)}
+            else:
+                doc = await generate(kind, upstream_md or user_text, session_id=session_id)
+                # 大文档分块：用较大块（400）减少 SSE 事件数，避免前端被上千次增量压垮（卡死修复）。
+                for chunk in _chunks(doc["markdown"], 400):
+                    yield chunk
             await self._advance_task(pid, session_id, steps, 3)  # 4 抽取追溯边(RTM)
             if pid:
                 await self._save_requirement(pid, kind, doc, session_id, hitl)
@@ -241,7 +266,15 @@ class Orchestrator:
                 ctx = await latest_content(self.db, pid, (target_type or "").lower())
             except Exception:
                 ctx = ""
-        yield await chat_reply(user_text, ctx)
+        if _openai_active():
+            # OpenAI 兼容端点：逐 token 真流式对话；思考链走 ("reasoning", text) → 前端折叠区
+            async for chn, d in chat_reply_stream(user_text, ctx):
+                if chn == "reasoning":
+                    yield ("reasoning", d)
+                else:
+                    yield d
+        else:
+            yield await chat_reply(user_text, ctx)
 
     # ---- 会话级模型选择（问题2）----
     async def _inject_active_model(self, pid, session_id):

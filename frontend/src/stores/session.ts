@@ -26,6 +26,8 @@ interface SessionState {
   push: (msg: ChatMsg) => void;
   /** SSE message.delta：增量逐 token 拼接（消息不存在则新建 assistant 消息）。 */
   appendDelta: (id: string, delta: string) => void;
+  /** SSE message.delta(channel=reasoning)：思考链增量，拼到 thinking（折叠区显示）。 */
+  appendThinking: (id: string, delta: string) => void;
   /** SSE message.end：结束流式态。 */
   finalize: (id: string) => void;
   /** 用户点「停止」：立即停掉该消息流式态，并忽略其后续 SSE 增量（问题1 立即停止、不再输出）。 */
@@ -67,6 +69,23 @@ export const useSessionStore = create<SessionState & { stopped: Record<string, b
       }
       const copy = [...st.messages];
       copy[i] = { ...copy[i], content: copy[i].content + delta, streaming: true };
+      return { messages: copy };
+    }),
+  appendThinking: (id, delta) =>
+    set((st) => {
+      if (st.stopped[id]) return {};
+      const i = st.messages.findIndex((m) => m.id === id);
+      if (i < 0) {
+        // 思考链可能先于正文到达：先建一条空正文的 assistant 消息承载 thinking
+        return {
+          messages: [
+            ...st.messages,
+            { id, role: "assistant", content: "", thinking: delta, streaming: true },
+          ],
+        };
+      }
+      const copy = [...st.messages];
+      copy[i] = { ...copy[i], thinking: (copy[i].thinking ?? "") + delta, streaming: true };
       return { messages: copy };
     }),
   finalize: (id) =>

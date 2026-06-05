@@ -32,6 +32,14 @@ async def create(body: ProjectIn, db: AsyncSession = Depends(get_db), _=Depends(
     db.add(p)
     await db.commit()
     await db.refresh(p)
+    # 开箱即用：新项目播种本地 Ollama 默认端点（失败不影响建项目）
+    if not p.name.startswith("__"):
+        try:
+            from ...services.settings import seed_default_endpoints
+
+            await seed_default_endpoints(db, str(p.id))
+        except Exception:  # noqa: BLE001
+            pass
     return ok(_dto(p))
 
 

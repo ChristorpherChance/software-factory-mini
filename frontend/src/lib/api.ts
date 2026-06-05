@@ -12,10 +12,10 @@ export const API_BASE = BASE;
 /**
  * SSE 专用基址：必须绕过 Next.js dev 的 rewrites 代理，因其会缓冲
  * text/event-stream，导致 EventSource 收不到实时事件（流式输出/生成内容看不到）。
- * 默认直连后端 8000；可用 NEXT_PUBLIC_SSE_BASE 覆盖（生产同源时设为 /api/v1）。
+ * 默认直连后端 8001；可用 NEXT_PUBLIC_SSE_BASE 覆盖（生产同源时设为 /api/v1）。
  */
 export const SSE_BASE =
-  process.env.NEXT_PUBLIC_SSE_BASE ?? "http://localhost:8000/api/v1";
+  process.env.NEXT_PUBLIC_SSE_BASE ?? "http://localhost:8001/api/v1";
 
 /** 统一请求：注入鉴权头与 JSON 头，非 2xx 抛错并带回 body。 */
 async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -569,6 +569,32 @@ export const api = {
         model: b.model,
         apiKey: b.apiKey,
         ...(b.provider ? { extra: { provider: b.provider } } : {}),
+      }),
+    }),
+  /** 编辑端点（PATCH 部分字段）。apiKey 留空表示保持原密钥不变。 */
+  updateEndpoint: (
+    pid: string,
+    eid: string,
+    b: {
+      kind?: string;
+      name?: string;
+      baseUrl?: string;
+      model?: string;
+      apiKey?: string;
+      provider?: string;
+      enabled?: boolean;
+    }
+  ) =>
+    req<{ id: string; name: string }>(`/projects/${pid}/endpoints/${eid}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        ...(b.kind !== undefined ? { kind: b.kind } : {}),
+        ...(b.name !== undefined ? { name: b.name } : {}),
+        ...(b.baseUrl !== undefined ? { baseUrl: b.baseUrl } : {}),
+        ...(b.model !== undefined ? { model: b.model } : {}),
+        ...(b.apiKey ? { apiKey: b.apiKey } : {}), // 空字符串不发，保持原密钥
+        ...(b.provider !== undefined ? { provider: b.provider } : {}),
+        ...(b.enabled !== undefined ? { enabled: b.enabled } : {}),
       }),
     }),
   /** 删除端点。 */

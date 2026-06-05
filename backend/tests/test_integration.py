@@ -207,7 +207,9 @@ async def test_settings_endpoint_secret_masked(client):
         json={"kind": "llm", "name": "main", "baseUrl": "https://api.x.com", "model": "m", "apiKey": "sk-SECRET-123456"},
     )
     eps = (await client.get(f"/api/v1/projects/{pid}/endpoints", headers=H)).json()["data"]
-    assert eps[0]["hasKey"] is True
+    # 新项目会自动播种本地 Ollama 默认端点，故按名定位刚建的 "main"（不能假设 index 0）
+    main = next(e for e in eps if e["name"] == "main")
+    assert main["hasKey"] is True
     # 整个响应体里不应出现明文
     assert "sk-SECRET-123456" not in json.dumps(eps)
 
