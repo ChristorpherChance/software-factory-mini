@@ -43,6 +43,12 @@ async def init_db() -> None:
     # 各阶段 Agent Prompt 系统默认种子（幂等；新表 create_all 已建好）
     from .db import SessionLocal
     from .services.prompt_seed import seed_prompts
+    from .services.settings import seed_endpoints_for_existing_projects
 
     async with SessionLocal() as s:
         await seed_prompts(s)
+        # 为现有项目 backfill 本地 Ollama 默认端点（仅当项目尚无 LLM 端点；幂等）
+        try:
+            await seed_endpoints_for_existing_projects(s)
+        except Exception:  # noqa: BLE001
+            log.warning("init_db: seed default endpoints skipped", exc_info=True)

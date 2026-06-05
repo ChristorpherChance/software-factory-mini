@@ -90,11 +90,15 @@ export function MessageStream() {
               <AssistantBubble content={m.content} streaming={m.streaming} />
             )}
 
-            {/* 思考过程折叠（thinking 非空才渲染 · C 档） */}
+            {/* 思考链折叠（推理模型 Qwen3/DeepSeek-R1 的 reasoning 通道；默认折叠，点击展开看实时思考） */}
             {!isUser && m.thinking && (
               <details className="block rounded-md bg-bg-subtle px-2.5 py-2 text-left">
-                <summary className="cursor-pointer text-xs font-medium text-text-muted">
-                  🧠 思考过程（点击展开）
+                <summary className="flex cursor-pointer items-center gap-1.5 text-xs font-medium text-text-muted">
+                  🤔 {m.streaming ? "思考中…" : "思考"}
+                  {m.streaming && (
+                    <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-warning" />
+                  )}
+                  <span className="text-text-muted/70">（点击展开）</span>
                 </summary>
                 <p className="mt-2 whitespace-pre-wrap text-[11px] leading-relaxed text-text-secondary">
                   {m.thinking}

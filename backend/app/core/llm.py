@@ -12,10 +12,13 @@
 import re
 import hashlib
 import json
+import logging
 
 from ..config import settings
 from .prompt_ctx import get_active_prompt
 from .model_ctx import get_active_model
+
+log = logging.getLogger(__name__)
 
 # 资料结构化输出 schema（骨架 §5.2 / M1 §7.3）
 MATERIAL_SCHEMA = {
@@ -426,7 +429,137 @@ async def _openai_chat(
     async with httpx.AsyncClient(timeout=_PI_TIMEOUT) as c:
         r = await c.post(url, json=payload, headers=headers)
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+        # 剔除 DeepSeek-R1 思考标签，避免污染文档/对话（问题4）
+        return _strip_think(r.json()["choices"][0]["message"]["content"])
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-R1 思考过滤：剔除 <think>…</think>，避免污染需求文档与对话。
+# 非流式用正则；流式用 _ThinkFilter 状态机（跨分片安全）。reasoning_content 字段不进正文。
+# ---------------------------------------------------------------------------
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+
+
+def _strip_think(text: str) -> str:
+    return re.sub(r"<think>[\s\S]*?</think>", "", text or "").strip()
+
+
+def _partial_tail(s: str, tag: str) -> int:
+    """返回 s 的最长后缀长度，使该后缀同时是 tag 的前缀（用于跨分片保留半截标签）。"""
+    for k in range(min(len(s), len(tag) - 1), 0, -1):
+        if s.endswith(tag[:k]):
+            return k
+    return 0
+
+
+class _ThinkFilter:
+    """流式剔除 <think>…</think>。feed() 增量返回可见文本，flush() 收尾。"""
+
+    def __init__(self) -> None:
+        self.buf = ""
+        self.in_think = False
+
+    def feed(self, text: str) -> str:
+        self.buf += text
+        out: list[str] = []
+        while self.buf:
+            if not self.in_think:
+                i = self.buf.find(_THINK_OPEN)
+                if i == -1:
+                    keep = _partial_tail(self.buf, _THINK_OPEN)
+                    cut = len(self.buf) - keep
+                    out.append(self.buf[:cut])
+                    self.buf = self.buf[cut:]
+                    break
+                out.append(self.buf[:i])
+                self.buf = self.buf[i + len(_THINK_OPEN):]
+                self.in_think = True
+            else:
+                j = self.buf.find(_THINK_CLOSE)
+                if j == -1:
+                    keep = _partial_tail(self.buf, _THINK_CLOSE)
+                    self.buf = self.buf[len(self.buf) - keep:]
+                    break
+                self.buf = self.buf[j + len(_THINK_CLOSE):]
+                self.in_think = False
+        return "".join(out)
+
+    def flush(self) -> str:
+        if self.in_think:
+            self.buf = ""
+            return ""
+        out, self.buf = self.buf, ""
+        return out
+
+
+async def _openai_chat_stream(
+    system: str,
+    user: str,
+    model: str,
+    base_url: str,
+    api_key: str | None,
+    temperature: float = 0.2,
+):
+    """OpenAI 兼容端点的 SSE 流式（Ollama/DeepSeek/qwen）：逐 token 产出 (channel, text)。
+
+    channel：
+    - "reasoning"：思考链（Qwen3 的 delta.reasoning / DeepSeek 的 reasoning_content）——
+      推理模型在思考阶段 content 为空，可能持续数十秒；若不产出它，前端会「卡住再一次性出」。
+    - "content"：正式答案（经 _ThinkFilter 剔除内联 <think>…</think>）。
+    调用方决定是否把 reasoning 显示到对话框（让流式可见）、是否计入文档（不计入，保文档干净）。
+    任何异常向上抛，由调用方回落（铁律#3）。"""
+    import httpx
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": temperature,
+        "stream": True,
+    }
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    flt = _ThinkFilter()
+    async with httpx.AsyncClient(timeout=_PI_TIMEOUT) as c:
+        async with c.stream("POST", url, json=payload, headers=headers) as r:
+            # 不用 raise_for_status（流式未读 body 时会掩盖真实错误）；显式读错误体便于定位
+            if r.status_code >= 400:
+                body = (await r.aread()).decode("utf-8", "ignore")[:400]
+                raise RuntimeError(f"openai stream HTTP {r.status_code}: {body}")
+            async for raw in r.aiter_lines():
+                line = raw.strip()
+                if not line:
+                    continue
+                # OpenAI 兼容是 SSE（data: 前缀）；个别服务直接吐 JSONL —— 两者都兼容
+                data = line[5:].strip() if line.startswith("data:") else line
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except Exception:  # noqa: BLE001
+                    continue
+                ch = (obj.get("choices") or [{}])[0]
+                # OpenAI 流式在 delta，Ollama 原生在 message；两者都取 content
+                seg = ch.get("delta") or ch.get("message") or {}
+                # 思考链通道：Qwen3=reasoning，DeepSeek=reasoning_content（思考期 content 为空）
+                rsn = seg.get("reasoning") or seg.get("reasoning_content")
+                if rsn:
+                    yield ("reasoning", rsn)
+                piece = seg.get("content")
+                if piece:
+                    vis = flt.feed(piece)
+                    if vis:
+                        yield ("content", vis)
+                if ch.get("finish_reason"):
+                    break
+    tail = flt.flush()
+    if tail:
+        yield ("content", tail)
 
 
 async def _anthropic_requirement_with(
@@ -507,6 +640,31 @@ async def generate_requirement(kind: str, upstream: str, session_id: str | None 
     if settings.llm_provider == "anthropic" and settings.llm_api_key:
         return await _anthropic_requirement(kind, upstream, session_id=session_id)
     return _stub_requirement(kind, upstream)
+
+
+async def generate_requirement_stream(kind: str, upstream: str):
+    """三件套流式生成，逐 token 产出 (channel, text)（channel: reasoning|content）。
+
+    仅当会话级 active model 为 OpenAI 兼容端点时真流式；非该端点或流式失败（且尚未产出）→
+    回落为一次性 yield ("content", generate_requirement 结果)。调用方只把 content 计入文档。"""
+    m = get_active_model()
+    if m and m.get("base_url") and m.get("provider") not in (None, "stub", "anthropic"):
+        system = get_active_prompt(f"requirement.{kind.lower()}") or _REQ_PROMPT[kind.lower()]
+        got = False
+        try:
+            async for chn, d in _openai_chat_stream(
+                system, upstream, m.get("model") or settings.llm_model, m["base_url"], m.get("api_key")
+            ):
+                got = True
+                yield (chn, d)
+            return
+        except Exception as e:  # noqa: BLE001
+            if got:
+                log.warning("generate stream interrupted after partial output: %r", e)
+                return  # 已部分产出 → 停在此处（铁律#3）
+            log.warning("generate stream failed, falling back to non-stream: %r", e)
+        # 未产出 → 回落一次性
+    yield ("content", await generate_requirement(kind, upstream))
 
 
 def _stub_beautify(draft: str) -> str:
@@ -764,3 +922,30 @@ async def chat_reply(user_text: str, doc_context: str = "") -> str:
         except Exception:
             pass
     return _CHAT_FALLBACK
+
+
+async def chat_reply_stream(user_text: str, doc_context: str = ""):
+    """对话式回答的流式版，逐 token 产出 (channel, text)（channel: reasoning|content）。
+
+    非 OpenAI 端点或流式失败（且尚未产出）→ 回落一次性 ("content", chat_reply)。绝不重写文档。"""
+    m = get_active_model()
+    if m and m.get("base_url") and m.get("provider") not in (None, "stub", "anthropic"):
+        user = (
+            f"【当前文档（节选）】\n{doc_context[:3000]}\n\n" if doc_context else ""
+        ) + f"【用户消息】\n{user_text}"
+        got = False
+        try:
+            async for chn, d in _openai_chat_stream(
+                _CHAT_SYSTEM, user, m.get("model") or settings.llm_model,
+                m["base_url"], m.get("api_key"), temperature=0.3,
+            ):
+                got = True
+                yield (chn, d)
+            return
+        except Exception as e:  # noqa: BLE001
+            if got:
+                log.warning("chat stream interrupted after partial output: %r", e)
+                return  # 已部分产出 → 停（铁律#3）
+            log.warning("chat stream failed, falling back to non-stream: %r", e)
+        # 未产出 → 回落一次性
+    yield ("content", await chat_reply(user_text, doc_context))

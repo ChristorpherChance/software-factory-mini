@@ -9,6 +9,7 @@ from ...deps import require_auth
 from ...db import get_db
 from ...models.entities import Endpoint, SettingAudit
 from ...core.crypto import encrypt, decrypt
+from ...core.errors import AppError
 from ...services.settings import resolve, set_override
 from ...services.settings_io import export_yaml, import_yaml
 from ._common import ok, paged
@@ -70,6 +71,34 @@ async def list_endpoints(pid: str, db: AsyncSession = Depends(get_db), _=Depends
             for e in rows
         ]
     )
+
+
+@router.patch("/projects/{pid}/endpoints/{eid}")
+async def update_endpoint(pid: str, eid: str, body: dict, db: AsyncSession = Depends(get_db), _=Depends(require_auth)):
+    """更新端点字段（问题2 编辑）。apiKey 为空/缺省 = 保持原密钥；provider 经 extra 合并。"""
+    ep = (
+        await db.execute(select(Endpoint).where(Endpoint.id == eid, Endpoint.project_id == pid))
+    ).scalars().first()
+    if not ep:
+        raise AppError(404, "endpoint not found")
+    if "name" in body:
+        ep.name = body["name"]
+    if "kind" in body:
+        ep.kind = body["kind"]
+    if "baseUrl" in body:
+        ep.base_url = body["baseUrl"]
+    if "model" in body:
+        ep.model = body["model"]
+    if "enabled" in body:
+        ep.enabled = bool(body["enabled"])
+    if body.get("provider") is not None:
+        ep.extra = {**(ep.extra or {}), "provider": body["provider"]}
+    # 仅当传了非空 apiKey 才改密钥；编辑表单留空表示不动原密钥
+    if body.get("apiKey"):
+        ep.api_key_cipher = encrypt(body["apiKey"])
+    await db.commit()
+    await db.refresh(ep)
+    return ok({"id": str(ep.id), "name": ep.name})
 
 
 @router.delete("/projects/{pid}/endpoints/{eid}")

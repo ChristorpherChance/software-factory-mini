@@ -4,8 +4,8 @@ import { useParams } from "next/navigation";
 import Link from "next/link";
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { ScrollText, Trash2 } from "lucide-react";
-import { api } from "@/lib/api";
+import { ScrollText, Trash2, Pencil } from "lucide-react";
+import { api, type EndpointDto } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { AgentPromptsTab } from "./AgentPromptsTab";
@@ -122,6 +122,24 @@ const PROVIDERS = ["openai", "ollama", "deepseek", "qwen", "anthropic"] as const
 // 快速预设：点击只预填表单，仍由用户点「新增端点」提交
 const PRESETS: Array<{ label: string; patch: Partial<EndpointForm> }> = [
   {
+    label: "Ollama Qwen3",
+    patch: {
+      name: "Ollama Qwen3",
+      provider: "ollama",
+      baseUrl: "http://localhost:11434/v1",
+      model: "qwen3.6:27b", // 改成你 `ollama list` 里的实际 tag
+    },
+  },
+  {
+    label: "Ollama DeepSeek-R1",
+    patch: {
+      name: "Ollama DeepSeek-R1",
+      provider: "ollama",
+      baseUrl: "http://localhost:11434/v1",
+      model: "deepseek-r1:14b",
+    },
+  },
+  {
     label: "Ollama(本地)",
     patch: {
       name: "Ollama 本地",
@@ -167,17 +185,38 @@ function EndpointsTab({ pid }: { pid: string }) {
     enabled: !!pid,
   });
   const [form, setForm] = useState<EndpointForm>(EMPTY_FORM);
+  // 正在编辑的端点 id（null=新增模式）
+  const [editingId, setEditingId] = useState<string | null>(null);
   // 记录每个端点的连通性测试结果
   const [results, setResults] = useState<Record<string, { reachable: boolean }>>({});
 
-  const create = useMutation({
-    // provider 一并传给后端（契约：createEndpoint 接收 provider → extra.provider）
-    mutationFn: () => api.createEndpoint(pid, form),
+  // 新增 or 保存修改：editingId 有值走 update，否则 create
+  const save = useMutation({
+    mutationFn: () =>
+      editingId ? api.updateEndpoint(pid, editingId, form) : api.createEndpoint(pid, form),
     onSuccess: () => {
       setForm(EMPTY_FORM);
+      setEditingId(null);
       qc.invalidateQueries({ queryKey: ["endpoints", pid] });
     },
   });
+
+  // 点「编辑」：把该端点载入表单（apiKey 不回填，留空=保持原密钥）
+  const startEdit = (e: EndpointDto) => {
+    setEditingId(e.id);
+    setForm({
+      kind: e.kind ?? "llm",
+      name: e.name ?? "",
+      baseUrl: e.baseUrl ?? "",
+      model: e.model ?? "",
+      apiKey: "",
+      provider: e.provider ?? "openai",
+    });
+  };
+  const cancelEdit = () => {
+    setEditingId(null);
+    setForm(EMPTY_FORM);
+  };
 
   const remove = useMutation({
     mutationFn: (eid: string) => api.deleteEndpoint(pid, eid),
@@ -226,6 +265,16 @@ function EndpointsTab({ pid }: { pid: string }) {
                   className="text-primary hover:underline"
                 >
                   测连通
+                </button>
+                <button
+                  onClick={() => startEdit(e)}
+                  title="编辑端点"
+                  className={cn(
+                    "flex h-6 w-6 items-center justify-center rounded text-text-muted hover:bg-bg hover:text-primary",
+                    editingId === e.id && "bg-primary-subtle text-primary"
+                  )}
+                >
+                  <Pencil className="h-3.5 w-3.5" />
                 </button>
                 <button
                   onClick={() => remove.mutate(e.id)}
@@ -280,7 +329,7 @@ function EndpointsTab({ pid }: { pid: string }) {
         {(["name", "baseUrl", "model", "apiKey"] as const).map((f) => (
           <input
             key={f}
-            placeholder={f}
+            placeholder={f === "apiKey" && editingId ? "apiKey（留空保持不变）" : f}
             type={f === "apiKey" ? "password" : "text"}
             className="rounded-md border border-border bg-bg px-2 py-1 outline-none focus:border-primary"
             value={form[f]}
@@ -288,14 +337,21 @@ function EndpointsTab({ pid }: { pid: string }) {
           />
         ))}
       </div>
-      <Button
-        variant="primary"
-        size="sm"
-        onClick={() => create.mutate()}
-        disabled={create.isPending || !form.name.trim()}
-      >
-        新增端点
-      </Button>
+      <div className="flex items-center gap-2">
+        <Button
+          variant="primary"
+          size="sm"
+          onClick={() => save.mutate()}
+          disabled={save.isPending || !form.name.trim()}
+        >
+          {editingId ? "保存修改" : "新增端点"}
+        </Button>
+        {editingId && (
+          <Button variant="ghost" size="sm" onClick={cancelEdit}>
+            取消编辑
+          </Button>
+        )}
+      </div>
     </div>
   );
 }

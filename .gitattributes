@@ -5,6 +5,10 @@
 # Shell 脚本必须 LF —— 带 CR 会让 bash 把 \r 当命令一部分而报错。
 *.sh    text eol=lf
 
+# 端口单一配置源：被 *.sh 用 `source` 读取，必须 LF；
+# 带 CR 会把端口污染成 "8001\r"，导致 uvicorn/Next 启动失败。
+ports.env text eol=lf
+
 # Windows 批处理 / PowerShell 必须 CRLF —— LF 会让 cmd.exe 解析错乱、闪退。
 *.bat   text eol=crlf
 *.cmd   text eol=crlf

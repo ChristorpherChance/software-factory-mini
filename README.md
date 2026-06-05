@@ -42,15 +42,21 @@ software-factory-mini/
 
 前置：Node ≥ 18、Python ≥ 3.11。
 
+> **端口配置（单一来源）**：后端默认 `8001`、前端默认 `3001`、agent-service `9100`。
+> 全部集中在仓库根 **`ports.env`**——要换端口只改这一个文件，`start.sh/start.bat/stop.sh/`
+> `cleanup_ports.ps1/run_backend.sh/run_frontend.sh` 都会读取它。Docker/云端用 docker-compose
+> 里同名的 `${BACKEND_PORT}/${FRONTEND_PORT}`（可在 `.env` 覆盖，改后需同步 `nginx/nginx.conf`）。
+> 下方手动命令里的 `8001/3001` 仅为默认值示例。
+
 ### 1) 后端
 ```bash
 cd backend
 python -m venv .venv
 .venv/Scripts/pip install -r requirements.txt     # Windows
 # 或 .venv/bin/pip install -r requirements.txt     # macOS/Linux
-.venv/Scripts/python -m uvicorn app.main:app --port 8000 --reload
+.venv/Scripts/python -m uvicorn app.main:app --port 8001 --reload
 ```
-打开 http://localhost:8000/docs 验证；健康检查 `GET /api/v1/health`。
+打开 http://localhost:8001/docs 验证；健康检查 `GET /api/v1/health`。
 首次启动自动建表（SQLite 文件 `backend/sfmini.db`）。
 
 ### 2) 前端
@@ -60,8 +66,8 @@ npm install
 cp .env.example .env.local
 npm run dev
 ```
-打开 http://localhost:3000 ——新建项目 → 进入工作台 → 在右侧对话区粘贴/发送资料触发解析 → 依次「生成 ORD/CRD/PRD」→ 矩阵中心看覆盖率 → 需求页底部运行自检并定稿。
-（前端 `/api/v1/*` 经 `next.config.mjs` rewrites 代理到后端 8000，SSE 直通。）
+打开 http://localhost:3001 ——新建项目 → 进入工作台 → 在右侧对话区粘贴/发送资料触发解析 → 依次「生成 ORD/CRD/PRD」→ 矩阵中心看覆盖率 → 需求页底部运行自检并定稿。
+（前端 `/api/v1/*` 经 `next.config.mjs` rewrites 代理到后端 8001，SSE 直通。）
 
 ### 3) 跑测试
 ```bash

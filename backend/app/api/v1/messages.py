@@ -9,10 +9,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ...deps import require_auth
 from ...db import get_db, SessionLocal
 from ...config import settings
-from ...models.entities import Message, Session
+from ...models.entities import Message, Session, SessionSettingOverride
 from ...core.events import publish
 from ...agents.orchestrator.state_machine import Orchestrator
 from ...agents.requirement.generator import extract_edges
+from ...services.settings import resolve_llm_endpoint
 from ._common import ok, paged, idem_get, idem_put
 
 router = APIRouter(tags=["messages"])
@@ -173,6 +174,41 @@ def _dto(m: Message) -> dict:
     }
 
 
+async def _has_model_override(db, sid: str) -> bool:
+    """会话是否选了「会话级模型端点」（OpenAI 兼容或 anthropic）。
+
+    Fix2：pi 模式下 agent-service WS 通道不认识会话级 model 选择，故选了端点就跳过 WS，
+    改走本地 Orchestrator.handle（其按 _openai_chat(_stream)/anthropic 路由并逐 delta publish）。"""
+    try:
+        s = await db.get(Session, sid)
+        pid = s.project_id if s else None
+        if not pid:
+            return False
+        ov = (
+            await db.execute(
+                select(SessionSettingOverride).where(
+                    SessionSettingOverride.session_id == sid,
+                    SessionSettingOverride.category == "model",
+                    SessionSettingOverride.key == "name",
+                )
+            )
+        ).scalars().first()
+        if not (ov and ov.value):
+            return False
+        name = ov.value if isinstance(ov.value, str) else (
+            ov.value.get("name") if isinstance(ov.value, dict) else None
+        )
+        if not name:
+            return False
+        ep = await resolve_llm_endpoint(db, pid, name)
+        prov = ep.get("provider")
+        if prov == "anthropic" and ep.get("api_key"):
+            return True
+        return bool(ep.get("base_url") and prov not in (None, "stub", "pi"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def _run_orchestrator(
     sid: str,
     user_text: str,
@@ -201,7 +237,9 @@ async def _run_orchestrator(
         #    它内部 generate_requirement 在 pi 模式下打 agent-service /requirement 出规范文档，
         #    并完成落库 Artifact/Version + RTM 边 + PendingChange（复用现有逻辑，零重写）。
         #  - 纯对话（chat）：走 agent-service WS 真 token 流式。
-        if settings.llm_provider == "pi":
+        # Fix2：若会话选了 OpenAI 兼容/anthropic 端点，跳过 pi WS，走下方本地 handle（模型选择生效）。
+        use_local_model = await _has_model_override(db, sid)
+        if settings.llm_provider == "pi" and not use_local_model:
             orch = Orchestrator(db)
             intent = orch._route(user_text)
             # 划选引用（问题3）：有引用片段则强制按定向编辑处理（parse_material 除外）。
@@ -322,6 +360,14 @@ async def _run_orchestrator(
             async for delta in Orchestrator(db).handle(
                 sid, user_text, hitl_mode, references, target_type, target_artifact_id, quote
             ):
+                # 推理模型思考链：("reasoning", text) → 单独推到前端折叠区，不计入消息正文/落库
+                if isinstance(delta, tuple) and delta and delta[0] == "reasoning":
+                    await publish(
+                        sid,
+                        "message.delta",
+                        {"msg_id": aid, "delta": delta[1], "role": "assistant", "channel": "reasoning"},
+                    )
+                    continue
                 buf += delta
                 await publish(
                     sid,

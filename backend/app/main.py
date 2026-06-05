@@ -25,7 +25,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="Software Factory Mini", version="0.1.0", lifespan=lifespan)
 
-# 本地开发：前端 3000 → 后端 8000 直连时放开 CORS（经 Nginx 同源时无影响）
+# 本地开发：前端 3001 → 后端 8001 直连时放开 CORS（经 Nginx 同源时无影响）
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

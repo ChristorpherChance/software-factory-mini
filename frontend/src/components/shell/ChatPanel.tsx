@@ -514,10 +514,13 @@ function ModelPicker({ pid, sid }: { pid: string; sid: string | null }) {
   });
   const llm = (endpoints ?? []).filter((e) => e.kind === "llm" && e.enabled);
   const pick = useMutation({
-    mutationFn: (name: string) => api.putOverride(pid, sid!, "model", "name", name),
+    // 存端点 id（后端 resolve_llm_endpoint 按 id 优先匹配），避免与 model 串名不一致
+    mutationFn: (endpointId: string) => api.putOverride(pid, sid!, "model", "name", endpointId),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["settings", pid] }),
   });
-  const current = model?.name ?? "默认";
+  // 覆盖值现在是端点 id；触发器标签按 id 查回该端点的 model（无则 name），无覆盖显示「默认」
+  const selected = llm.find((e) => e.id === model?.name);
+  const current = selected ? selected.model ?? selected.name : "默认";
 
   // 按 provider 分组：provider 为空归到「其它 / 默认」组，常见 provider 排前
   const groups = groupByProvider(llm);
@@ -584,7 +587,7 @@ function ModelPicker({ pid, sid }: { pid: string; sid: string | null }) {
                         ev.preventDefault();
                         return;
                       }
-                      if (sid) pick.mutate(name);
+                      if (sid) pick.mutate(e.id);
                     }}
                     className={cn(
                       "flex-col items-start gap-0.5",
@@ -592,7 +595,7 @@ function ModelPicker({ pid, sid }: { pid: string; sid: string | null }) {
                     )}
                   >
                     <span className="flex w-full items-center gap-1.5">
-                      {model?.name === name && <span className="text-primary">●</span>}
+                      {model?.name === e.id && <span className="text-primary">●</span>}
                       <span className="truncate text-[13px] text-text">{name}</span>
                       {/* 连通态标记：检测中… / ✅ / ❌ */}
                       <span className="ml-auto flex shrink-0 items-center">
