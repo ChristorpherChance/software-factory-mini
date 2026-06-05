@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef, useMemo, type ReactNode } from "react";
+import { useEffect, useState, useRef, useMemo } from "react";
 import Link from "next/link";
 import { useParams, useSearchParams } from "next/navigation";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -9,19 +9,29 @@ import {
   History,
   GitCompare,
   Lock,
-  Upload,
+  Unlock,
+  Download,
+  Undo2,
+  Redo2,
   MoreHorizontal,
   Check,
   X,
   RotateCw,
+  RotateCcw,
   FileText,
   Wand2,
   ChevronDown,
   UploadCloud,
+  Quote,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api, type ArtifactDto, type PendingChangeDto, type MaterialDto } from "@/lib/api";
+import {
+  downloadMarkdown,
+  exportDocFromHtml,
+  exportPdfFromHtml,
+} from "@/lib/export";
 import { Segmented } from "@/components/ui/segmented";
 import { Button } from "@/components/ui/button";
 import {
@@ -74,18 +84,6 @@ function parseToc(md: string): TocItem[] {
   return out;
 }
 
-// ReactMarkdown heading 组件：按出现顺序注入 id（与 parseToc 对齐），供 TOC 点击跳转。
-// 每次渲染新建（计数器从 0 重置），避免跨渲染累加。
-function makeMdComponents() {
-  let ord = 0;
-  const mk = (Tag: "h1" | "h2" | "h3" | "h4" | "h5" | "h6") =>
-    function Heading(props: { children?: ReactNode }) {
-      const id = `h-${ord++}`;
-      return <Tag id={id}>{props.children}</Tag>;
-    };
-  return { h1: mk("h1"), h2: mk("h2"), h3: mk("h3"), h4: mk("h4"), h5: mk("h5"), h6: mk("h6") };
-}
-
 type ViewMode = "render" | "source" | "diff";
 
 export function RequirementView() {
@@ -96,6 +94,8 @@ export function RequirementView() {
   const push = useSessionStore((s) => s.push);
   const mode = useHitlStore((s) => s.mode);
   const setEditTarget = useEditTargetStore((s) => s.setTarget);
+  // 问题3：划选文档片段后写入 store，供对话区显示「引用 chip」并定向编辑
+  const setQuote = useEditTargetStore((s) => s.setQuote);
 
   const [section, setSection] = useState<SectionKey>("crd");
   const [view, setView] = useState<ViewMode>("render");
@@ -104,12 +104,32 @@ export function RequirementView() {
   const [selVer, setSelVer] = useState<number | null>(null);
   const [draft, setDraft] = useState<string>("");
   const [dirty, setDirty] = useState(false);
+  // 撤销栈：source 编辑前的历史快照（pop 一个即恢复上一步）
+  const [history, setHistory] = useState<string[]>([]);
+  // 重做栈（问题7）：撤销时把当前值压入；重做时弹出恢复；新编辑发生时清空
+  const [redo, setRedo] = useState<string[]>([]);
 
   // 参考资料栏状态（20260603）
   const [refIds, setRefIds] = useState<string[]>([]);
   const [refDropdown, setRefDropdown] = useState(false);
   const [refInitialized, setRefInitialized] = useState(false);
-  const mdInput = useRef<HTMLInputElement>(null);
+
+  // 渲染态 <article> 引用（导出 doc/pdf 取其 innerHTML）；文档主体滚动容器引用（TOC 精准联动）
+  const articleRef = useRef<HTMLElement>(null);
+  const docScrollRef = useRef<HTMLDivElement>(null);
+  // 目录侧栏容器引用（问题8：activeTocId 变化时把高亮项居中到目录可视区）
+  const tocAsideRef = useRef<HTMLDivElement>(null);
+
+  // 问题8：当前高亮的目录项「序号」（点击 TOC 或滚动联动时更新；-1 表示无）。
+  // 用序号而非 id：导航统一按「DOM 中第 i 个标题」定位，免疫 id 漂移与分段渲染。
+  const [activeIdx, setActiveIdx] = useState<number>(-1);
+
+  // 问题3：划选引用浮动按钮（落点 = 选区相对文档滚动容器的坐标）
+  const [quoteBtn, setQuoteBtn] = useState<{
+    text: string;
+    top: number;
+    left: number;
+  } | null>(null);
 
   // 支持 ?view= query 联动（PendingActions 的 D 跳 diff 用）
   useEffect(() => {
@@ -138,16 +158,19 @@ export function RequirementView() {
     enabled: !!artifact,
   });
 
-  // 切换 section/工件时复位选中版本与草稿
+  // 切换 section/工件时复位选中版本、草稿与撤销栈
+  // 注意：仅依赖 artifact?.id（切换 section/工件），不随 view 切换复位，
+  //       保证 source 视图的编辑切回 render 时仍生效（问题7）。
   useEffect(() => {
     setSelVer(null);
     setDirty(false);
+    setDraft("");
+    setHistory([]);
+    setRedo([]);
   }, [artifact?.id]);
-  // 选中版本默认 = 最高版
-  useEffect(() => {
-    if (artifact && selVer == null) setSelVer(ver);
-  }, [artifact, ver, selVer]);
-
+  // 注意：不再把 selVer 钉死到当前最高版（问题1B）。
+  // selVer == null 即“跟随最新”——这样定向编辑确认产生新版本后，视图会自动切到最新版显示改动；
+  // 仅当用户从版本下拉显式选择历史版本时 selVer 才为具体数字。
   // 选中历史版本时单独拉取其内容（最高版直接用 list 已带的最新 content）
   const isLatestSel = selVer == null || selVer === ver;
   const { data: selVersionData, isFetching: selFetching } = useQuery({
@@ -159,9 +182,8 @@ export function RequirementView() {
   const baseContent = isLatestSel ? artifact?.content ?? "" : selVersionData?.content ?? "";
   const shown = dirty ? draft : baseContent;
 
-  // 解析真实 TOC（基于当前显示内容）+ heading id 注入组件
-  const toc = useMemo(() => parseToc(shown), [shown]);
-  const mdComponents = makeMdComponents();
+  // TOC 在 ownPending 计算后定义（见下方 renderedDocContent），导航改用「DOM 第 i 个标题」
+  // 索引定位，免疫 ReactMarkdown id 计数漂移与 InlineHighlightView 分段渲染（问题2）。
 
   // 已定稿资料（参考资料候选）：资料阶段（内容解析定稿）+ 需求页直接上传的专用参考（crd_ref）
   const { data: materials } = useQuery({
@@ -186,13 +208,39 @@ export function RequirementView() {
     return [...stage, ...refs.filter((m) => !seen.has(m.id))];
   }, [materials, crdRefMats]);
 
-  // 默认加载：首次拿到已定稿资料时，自动全选为参考资料
+  // 问题1：CRD 工件状态（PRD 阶段判断是否已定稿 + 自动关联 CRD 定稿文档）
+  const { data: crdArtifact } = useQuery({
+    queryKey: ["artifacts", pid, "crd"],
+    queryFn: async () => {
+      const list = await api.artifacts(pid, "crd");
+      return ((list ?? [])[0] as ArtifactDto | undefined) ?? null;
+    },
+    enabled: !!pid,
+  });
+  const crdFinalized = crdArtifact?.status === "finalized";
+
+  // 切换 section 时复位参考资料初始化标志，按新 section 重新应用默认（问题1）
   useEffect(() => {
-    if (!refInitialized && finalizedMats.length > 0) {
-      setRefIds(finalizedMats.map((m) => m.id));
+    setRefInitialized(false);
+    setRefIds([]);
+  }, [section]);
+
+  // 默认加载（问题1，按 section 区分）：
+  //  - crd：维持现状，首次拿到已定稿资料时自动全选为参考资料。
+  //  - prd：默认不自动选资料（refIds=[]），CRD 定稿文档由后端自动关联（栏内显示信息 chip）。
+  //         用户仍可手动叠加勾选资料。
+  useEffect(() => {
+    if (refInitialized) return;
+    if (section === "crd") {
+      if (finalizedMats.length > 0) {
+        setRefIds(finalizedMats.map((m) => m.id));
+        setRefInitialized(true);
+      }
+    } else {
+      // prd：直接标记已初始化，保持空选（不自动带资料）
       setRefInitialized(true);
     }
-  }, [finalizedMats, refInitialized]);
+  }, [section, finalizedMats, refInitialized]);
 
   const saveRefs = useMutation({
     mutationFn: (ids: string[]) =>
@@ -222,6 +270,22 @@ export function RequirementView() {
     [pendings, artifact?.id]
   );
   const hasPendingHighlight = !!ownPending?.diffBlocks?.some((b) => b.state === "pending");
+  // 性能（修复大文档卡死）：PRD/CRD 首版或大改会产生大量 diff 块，行内高亮会为每块各渲染
+  // 一个 ReactMarkdown → 主线程阻塞。超过阈值则跳过行内高亮，改普通渲染 + 提示去并排 Diff。
+  const pendingBlockCount =
+    ownPending?.diffBlocks?.filter((b) => b.state === "pending").length ?? 0;
+  const INLINE_HL_LIMIT = 25;
+  const useInlineHighlight = hasPendingHighlight && !!ownPending && pendingBlockCount <= INLINE_HL_LIMIT;
+
+  // 问题1A：定向编辑的 pending 携带「修改后全文」(diff.newMd)。行内高亮的锚点基于“新行”，
+  // 因此必须用 newMd 作为底稿渲染，才能把改动准确高亮在原文对应位置；否则锚点落空→无高亮。
+  // 生成(create)类 pending 无 newMd，回落当前内容 shown（其本身即新文档）。
+  const highlightContent =
+    ((ownPending?.diff as any)?.newMd as string | undefined) ?? shown;
+  // 渲染态实际展示的文档内容：用行内高亮时展示 newMd 预览，否则展示当前版本/草稿。
+  const renderedDocContent = useInlineHighlight ? highlightContent : shown;
+  // TOC 基于实际渲染内容解析（保证标题数与 DOM 中的 h1-h6 一一对应，供索引定位）。
+  const toc = useMemo(() => parseToc(renderedDocContent), [renderedDocContent]);
 
   const refreshAll = () => {
     qc.invalidateQueries({ queryKey: ["pending-changes"] });
@@ -271,41 +335,103 @@ export function RequirementView() {
     },
   });
 
-  // 按目录大纲建 Task（每章节一条，软关联 code=<KIND>-S<n>），在右侧进度区逐步完成
-  const createSectionTasks = useMutation({
+  // 工件定稿（status → finalized，version+1，publish artifact.created）
+  const finalize = useMutation({
     mutationFn: () =>
-      api.createTasks(
-        pid,
-        toc.map((t, i) => ({
-          code: `${section.toUpperCase()}-S${i + 1}`,
-          title: t.label,
-          stage: "requirement",
-        }))
-      ),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["tasks", pid] }),
+      artifact ? api.finalizeArtifact(pid, artifact.id) : Promise.resolve(null as any),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["artifacts", pid, section] });
+      qc.invalidateQueries({ queryKey: ["artifact-versions", artifact?.id] });
+    },
   });
 
-  // 上传参考资料（任意格式）：走真实上传+解析管线（PDF/Word/图片由后端 extract 抽取），
-  // asReference 直接视为内容解析定稿，立即作为参考资料。
-  const uploadMd = useMutation({
-    mutationFn: async (file: File) => {
-      const uploaded = await api.uploadFile(pid, file);
-      return api.parseMaterial(pid, {
-        file_id: uploaded.id,
-        asReference: true,
-        scope: "crd_ref", // 需求页专用参考资料，不进资料阶段列表（问题4）
-      });
-    },
-    onSuccess: (m) => {
-      qc.invalidateQueries({ queryKey: ["materials", pid, "crd_ref"] });
-      qc.invalidateQueries({ queryKey: ["files", pid] });
-      if (m?.id) setRefIds((cur) => [...cur, m.id]);
+  // 解锁定稿（问题9）：status 置回 draft，version+1
+  const unfinalize = useMutation({
+    mutationFn: () =>
+      artifact ? api.unfinalizeArtifact(pid, artifact.id) : Promise.resolve(null as any),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["artifacts", pid, section] });
+      qc.invalidateQueries({ queryKey: ["artifact-versions"] });
     },
   });
-  const onPickMd = (file: File | undefined) => {
-    if (!file) return;
-    uploadMd.mutate(file);
+
+  // 版本回退：把选中的历史版本回退为新最高版（问题7）
+  const rollback = useMutation({
+    mutationFn: (toVersion: number) =>
+      artifact ? api.rollback(artifact.id, toVersion) : Promise.resolve(null as any),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["artifacts", pid, section] });
+      qc.invalidateQueries({ queryKey: ["artifact-versions", artifact?.id] });
+      setDirty(false);
+      if (res?.newVersion) setSelVer(res.newVersion);
+    },
+  });
+
+  // 撤销（问题7）：把当前显示值压入 redo 栈，恢复到上一个 history 快照
+  const undo = () => {
+    setHistory((h) => {
+      if (h.length === 0) return h;
+      const prev = h[h.length - 1];
+      const cur = dirty ? draft : baseContent; // 撤销前的当前值进入 redo
+      setRedo((r) => [...r, cur]);
+      setDraft(prev);
+      setDirty(true);
+      return h.slice(0, -1);
+    });
   };
+
+  // 重做（问题7）：从 redo 栈弹出恢复，并把被恢复前的当前值压回 history
+  const redoEdit = () => {
+    setRedo((r) => {
+      if (r.length === 0) return r;
+      const next = r[r.length - 1];
+      const cur = dirty ? draft : baseContent; // 重做前的当前值压回 history
+      setHistory((h) => (h.length > 0 && h[h.length - 1] === cur ? h : [...h, cur]));
+      setDraft(next);
+      setDirty(true);
+      return r.slice(0, -1);
+    });
+  };
+
+  // 问题3：在渲染态 article 上划选文本 → 在选区附近弹出「引用到对话框」浮动按钮。
+  const onArticleMouseUp = () => {
+    const sel = window.getSelection();
+    const text = sel?.toString().trim() ?? "";
+    const container = docScrollRef.current;
+    const article = articleRef.current;
+    if (!text || !sel || sel.rangeCount === 0 || !container || !article) {
+      setQuoteBtn(null);
+      return;
+    }
+    // 选区必须落在 article 内（避免选到其它区域）
+    const range = sel.getRangeAt(0);
+    if (!article.contains(range.commonAncestorContainer)) {
+      setQuoteBtn(null);
+      return;
+    }
+    // 选区矩形相对滚动容器的坐标（容器内绝对定位浮动按钮）
+    const rect = range.getBoundingClientRect();
+    const cRect = container.getBoundingClientRect();
+    const top = rect.top - cRect.top + container.scrollTop - 34; // 浮在选区上方
+    const left = rect.left - cRect.left + container.scrollLeft;
+    setQuoteBtn({ text, top: Math.max(top, 0), left });
+  };
+
+  // 点击浮动按钮：把选中片段写入 store（供对话区显示引用 chip 并定向编辑），清理选区与按钮
+  const applyQuote = () => {
+    if (!quoteBtn) return;
+    setQuote(quoteBtn.text);
+    window.getSelection()?.removeAllRanges();
+    setQuoteBtn(null);
+  };
+
+  // 导出文件名：优先工件标题，否则 section 大写
+  const exportName = artifact?.title || section.toUpperCase();
+  // doc/pdf 取已渲染 <article> 的 innerHTML 以保留排版；
+  // 若当前不在渲染态（articleRef 不可用），回退为把源文本包进 <pre>。
+  const exportInnerHtml = () =>
+    articleRef.current?.innerHTML ??
+    `<pre>${shown.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>`;
 
   // 切换 section 时，复位 view 模式（避免源码态残留到渲染态）
   useEffect(() => setView("render"), [section]);
@@ -315,6 +441,74 @@ export function RequirementView() {
     setEditTarget(section, artifact?.id ?? null);
     return () => setEditTarget(null, null);
   }, [section, artifact?.id, setEditTarget]);
+
+  // 问题8：取文档滚动容器内所有标题元素（按文档顺序）。其索引与 toc 一一对应，
+  // 同时兼容「普通渲染」与「InlineHighlightView 分段渲染」两条路径（都产出真实 h1-h6）。
+  const getHeadingEls = (): HTMLElement[] => {
+    const c = docScrollRef.current;
+    return c ? Array.from(c.querySelectorAll<HTMLElement>("h1,h2,h3,h4,h5,h6")) : [];
+  };
+
+  // 点击目录：把文档容器滚动到第 idx 个标题（getBoundingClientRect 算容器内相对偏移，
+  // 不依赖 offsetParent / heading id，彻底修复点击不跳转，问题2-1）。
+  const scrollToHeading = (idx: number) => {
+    const container = docScrollRef.current;
+    if (!container) return;
+    const el = getHeadingEls()[idx];
+    if (!el) return;
+    const top =
+      el.getBoundingClientRect().top -
+      container.getBoundingClientRect().top +
+      container.scrollTop -
+      12;
+    container.scrollTo({ top, behavior: "smooth" });
+  };
+
+  // 问题8/2-2：滚动联动 — 仅渲染态时监听容器滚动，按 DOM 标题计算视口顶部对应的最近标题序号。
+  useEffect(() => {
+    const container = docScrollRef.current;
+    if (view !== "render" || !container || toc.length === 0) return;
+    let raf = 0;
+    const compute = () => {
+      raf = 0;
+      const els = getHeadingEls();
+      if (els.length === 0) return;
+      const cTop = container.getBoundingClientRect().top;
+      let current = 0;
+      for (let i = 0; i < els.length; i++) {
+        const rel = els[i].getBoundingClientRect().top - cTop;
+        if (rel <= 16) current = i; // 取顶部阈值内的最后一个标题
+        else break;
+      }
+      setActiveIdx(current);
+    };
+    const onScroll = () => {
+      if (raf) return; // 节流：每帧至多一次
+      raf = requestAnimationFrame(compute);
+    };
+    container.addEventListener("scroll", onScroll, { passive: true });
+    compute(); // 初次进入即定位一次
+    return () => {
+      container.removeEventListener("scroll", onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [view, toc]);
+
+  // 问题8：activeIdx 变化时把对应目录按钮在目录侧栏内居中（容器内相对滚动，不连带整页滚动）。
+  useEffect(() => {
+    if (activeIdx < 0) return;
+    const aside = tocAsideRef.current;
+    if (!aside) return;
+    const btn = aside.querySelector<HTMLElement>(`[data-tocidx="${activeIdx}"]`);
+    if (!btn) return;
+    const target =
+      btn.getBoundingClientRect().top -
+      aside.getBoundingClientRect().top +
+      aside.scrollTop -
+      aside.clientHeight / 2 +
+      btn.clientHeight / 2;
+    aside.scrollTo({ top: target, behavior: "smooth" });
+  }, [activeIdx]);
 
   const canDiff = ver > 1;
   const remaining = (pendings ?? []).length;
@@ -422,7 +616,20 @@ export function RequirementView() {
             <UploadCloud className="h-3.5 w-3.5" />
             {submitVersion.isPending ? "提交中…" : "版本提交"}
           </Button>
-          {[Pencil, History, GitCompare, Upload].map((Icon, i) => (
+          {/* 选中历史版本时显示回退按钮：回退到 v{selVer} 为新最高版（问题7） */}
+          {artifact && !isLatestSel && selVer != null && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => rollback.mutate(selVer)}
+              disabled={rollback.isPending}
+              title={`将 v${selVer} 回退为新最高版本`}
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              {rollback.isPending ? "回退中…" : `回退到 v${selVer}`}
+            </Button>
+          )}
+          {[Pencil, History, GitCompare].map((Icon, i) => (
             <button
               key={i}
               className="flex h-8 w-8 items-center justify-center rounded-md border border-border bg-bg-subtle text-text-secondary hover:bg-border/40"
@@ -431,100 +638,167 @@ export function RequirementView() {
               <Icon className="h-3.5 w-3.5" />
             </button>
           ))}
-          <Button variant="primary" size="sm" disabled={!artifact}>
-            <Lock className="h-3.5 w-3.5" /> 定稿
-          </Button>
-          <button
-            className="flex h-8 w-8 items-center justify-center rounded-md border border-border bg-bg-subtle text-text-secondary hover:bg-border/40"
-            title="更多"
+          {/* 下载/导出下拉（问题4）：Markdown / Word(.doc) / PDF(打印) */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                className="flex h-8 w-8 items-center justify-center rounded-md border border-border bg-bg-subtle text-text-secondary hover:bg-border/40 disabled:opacity-50"
+                title="下载 / 导出"
+                disabled={!artifact}
+              >
+                <Download className="h-3.5 w-3.5" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem
+                className="text-xs"
+                onSelect={() => downloadMarkdown(exportName, shown)}
+              >
+                下载 Markdown（.md）
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                className="text-xs"
+                onSelect={() => exportDocFromHtml(exportName, exportInnerHtml(), exportName)}
+              >
+                另存为 Word（.doc）
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                className="text-xs"
+                onSelect={() => exportPdfFromHtml(exportInnerHtml(), exportName)}
+              >
+                导出 PDF（打印）
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          {/* 定稿（问题6）：status==='finalized' 时显示「已定稿」且禁用 */}
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={() => finalize.mutate()}
+            disabled={!artifact || artifact.status === "finalized" || finalize.isPending}
+            title={artifact?.status === "finalized" ? "已定稿" : "定稿（锁定为正式版本）"}
           >
-            <MoreHorizontal className="h-3.5 w-3.5" />
-          </button>
+            <Lock className="h-3.5 w-3.5" />
+            {artifact?.status === "finalized"
+              ? "已定稿"
+              : finalize.isPending
+              ? "定稿中…"
+              : "定稿"}
+          </Button>
+          {/* 更多（问题9）：已定稿时提供「解锁定稿」；未定稿时显示禁用占位项 */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                className="flex h-8 w-8 items-center justify-center rounded-md border border-border bg-bg-subtle text-text-secondary hover:bg-border/40 disabled:opacity-50"
+                title="更多"
+                disabled={!artifact}
+              >
+                <MoreHorizontal className="h-3.5 w-3.5" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {artifact?.status === "finalized" ? (
+                <DropdownMenuItem
+                  className="text-xs"
+                  onSelect={() => unfinalize.mutate()}
+                  disabled={unfinalize.isPending}
+                >
+                  <Unlock className="h-3.5 w-3.5" />
+                  {unfinalize.isPending ? "解锁中…" : "🔓 解锁定稿"}
+                </DropdownMenuItem>
+              ) : (
+                <DropdownMenuItem className="text-xs text-text-muted" disabled>
+                  仅已定稿工件可解锁
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </div>
 
-      {/* 参考资料栏（20260603）：默认加载已定稿资料，可下拉勾选 + 上传 .md */}
-      <div className="flex items-center gap-2 border-y border-border bg-primary-subtle/30 px-5 py-2">
-        <span className="shrink-0 text-xs font-semibold text-text-secondary">📎 参考资料</span>
+      {/* 参考资料栏（20260603）：默认加载已定稿资料，可下拉勾选（上传入口已移至资料阶段） */}
+      <div className="border-y border-border bg-primary-subtle/30 px-5 py-2">
+        <div className="flex items-center gap-2">
+          <span className="shrink-0 text-xs font-semibold text-text-secondary">📎 参考资料</span>
 
-        {/* 已选标签 */}
-        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
-          {refIds.length === 0 ? (
-            <span className="text-xs text-text-muted">未选择（默认使用全部已定稿资料）</span>
-          ) : (
-            refIds.map((id) => {
-              const m = finalizedMats.find((x) => x.id === id);
-              return (
-                <span
-                  key={id}
-                  className="inline-flex items-center gap-1 rounded-full bg-bg border border-border px-2 py-0.5 text-[11px] text-text"
-                >
-                  <FileText className="h-3 w-3 text-text-secondary" />
-                  {m?.title ?? id.slice(0, 6)}
-                  <button onClick={() => toggleRef(id)} className="text-text-muted hover:text-error">
-                    <X className="h-3 w-3" />
-                  </button>
-                </span>
-              );
-            })
-          )}
-        </div>
-
-        {/* 下拉勾选 */}
-        <div className="relative shrink-0">
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => setRefDropdown((v) => !v)}
-          >
-            勾选资料 <ChevronDown className="h-3.5 w-3.5" />
-          </Button>
-          {refDropdown && (
-            <div className="absolute right-0 z-20 mt-1 max-h-64 w-60 overflow-y-auto rounded-md border border-border bg-bg-elevated p-1 shadow-lg">
-              {finalizedMats.length === 0 ? (
-                <p className="p-2 text-[11px] text-text-muted">
-                  暂无已定稿资料，请先在资料阶段定稿。
-                </p>
-              ) : (
-                finalizedMats.map((m) => (
-                  <button
-                    key={m.id}
-                    onClick={() => toggleRef(m.id)}
-                    className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[13px] text-text hover:bg-bg-subtle"
+          {/* 已选标签 */}
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+            {/* PRD 阶段：CRD 定稿文档自动关联（不可移除信息 chip，问题1） */}
+            {section === "prd" && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-primary-subtle border border-primary/30 px-2 py-0.5 text-[11px] font-medium text-primary">
+                📎 CRD 定稿文档（自动关联）
+              </span>
+            )}
+            {refIds.length === 0 && section !== "prd" ? (
+              <span className="text-xs text-text-muted">未选择（默认使用全部已定稿资料）</span>
+            ) : refIds.length === 0 && section === "prd" ? (
+              <span className="text-xs text-text-muted">默认不带资料，可手动叠加勾选</span>
+            ) : (
+              refIds.map((id) => {
+                const m = finalizedMats.find((x) => x.id === id);
+                return (
+                  <span
+                    key={id}
+                    className="inline-flex items-center gap-1 rounded-full bg-bg border border-border px-2 py-0.5 text-[11px] text-text"
                   >
-                    {refIds.includes(m.id) ? (
-                      <Check className="h-3.5 w-3.5 text-primary" />
-                    ) : (
-                      <span className="h-3.5 w-3.5" />
-                    )}
-                    <span className="min-w-0 flex-1 truncate">{m.title}</span>
-                  </button>
-                ))
-              )}
-            </div>
-          )}
+                    <FileText className="h-3 w-3 text-text-secondary" />
+                    {m?.title ?? id.slice(0, 6)}
+                    <button onClick={() => toggleRef(id)} className="text-text-muted hover:text-error">
+                      <X className="h-3 w-3" />
+                    </button>
+                  </span>
+                );
+              })
+            )}
+          </div>
+
+          {/* 下拉勾选 */}
+          <div className="relative shrink-0">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => setRefDropdown((v) => !v)}
+            >
+              勾选资料 <ChevronDown className="h-3.5 w-3.5" />
+            </Button>
+            {refDropdown && (
+              <div className="absolute right-0 z-20 mt-1 max-h-64 w-60 overflow-y-auto rounded-md border border-border bg-bg-elevated p-1 shadow-lg">
+                {finalizedMats.length === 0 ? (
+                  <p className="p-2 text-[11px] text-text-muted">
+                    暂无已定稿资料，请先在资料阶段定稿。
+                  </p>
+                ) : (
+                  finalizedMats.map((m) => (
+                    <button
+                      key={m.id}
+                      onClick={() => toggleRef(m.id)}
+                      className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[13px] text-text hover:bg-bg-subtle"
+                    >
+                      {refIds.includes(m.id) ? (
+                        <Check className="h-3.5 w-3.5 text-primary" />
+                      ) : (
+                        <span className="h-3.5 w-3.5" />
+                      )}
+                      <span className="min-w-0 flex-1 truncate">{m.title}</span>
+                    </button>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
         </div>
 
-        {/* 上传 .md */}
-        <Button
-          variant="secondary"
-          size="sm"
-          className="shrink-0"
-          onClick={() => mdInput.current?.click()}
-          disabled={uploadMd.isPending}
-        >
-          <Upload className="h-3.5 w-3.5" /> {uploadMd.isPending ? "上传中…" : "上传参考资料"}
-        </Button>
-        <input
-          ref={mdInput}
-          type="file"
-          accept=".md,.markdown,.txt,.pdf,.docx,.png,.jpg,.jpeg"
-          hidden
-          onChange={(e) => {
-            onPickMd(e.target.files?.[0]);
-            e.target.value = "";
-          }}
-        />
+        {/* PRD 阶段提示：已定稿 CRD 由后端作为主要参考资料（问题1/6） */}
+        {section === "prd" &&
+          (crdFinalized ? (
+            <p className="mt-1.5 text-[11px] text-text-muted">
+              PRD 将以已定稿 CRD 为主要参考资料
+            </p>
+          ) : (
+            <p className="mt-1.5 text-[11px] font-medium text-warning">
+              ⚠ CRD 未定稿：建议先在 CRD 标签定稿，PRD 将以最新 CRD 生成
+            </p>
+          ))}
       </div>
 
       {/* 横切活动条（C 档：审查 / 安全 静态占位，TODO 真实数据源） */}
@@ -536,17 +810,39 @@ export function RequirementView() {
         <span className="text-text-muted">TODO 真实数据源 · 失败项可跳转</span>
       </div>
 
-      {/* Segmented + pending 汇总条 */}
+      {/* Segmented + 撤销 + pending 汇总条 */}
       <div className="flex items-center justify-between px-5 py-2.5">
-        <Segmented
-          value={view}
-          onChange={(v) => setView(v as ViewMode)}
-          options={[
-            { value: "render", label: "渲染" },
-            { value: "source", label: "Markdown 源码" },
-            { value: "diff",   label: "并排 Diff" },
-          ]}
-        />
+        <div className="flex items-center gap-1.5">
+          <Segmented
+            value={view}
+            onChange={(v) => setView(v as ViewMode)}
+            options={[
+              { value: "render", label: "渲染" },
+              { value: "source", label: "Markdown 源码" },
+              { value: "diff",   label: "并排 Diff" },
+            ]}
+          />
+          {/* 撤销：恢复草稿到上一步快照（栈空时禁用，问题7） */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={undo}
+            disabled={history.length === 0}
+            title={history.length === 0 ? "无可撤销的编辑" : "撤销上一步编辑"}
+          >
+            <Undo2 className="h-3.5 w-3.5" /> 撤销
+          </Button>
+          {/* 重做：从重做栈恢复（栈空时禁用，问题7） */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={redoEdit}
+            disabled={redo.length === 0}
+            title={redo.length === 0 ? "无可重做的编辑" : "重做下一步编辑"}
+          >
+            <Redo2 className="h-3.5 w-3.5" /> 重做
+          </Button>
+        </div>
         {remaining > 0 && (
           <div className="flex items-center gap-2 rounded-md border border-pending bg-warning-subtle py-1.5 pl-3 pr-1.5">
             <span className="text-xs font-semibold text-warning">
@@ -580,51 +876,58 @@ export function RequirementView() {
 
       {/* 内容区：TOC 两栏 */}
       <div className="flex min-h-0 flex-1 overflow-hidden">
-        {/* TOC（C 档：静态。TODO 解析 markdown heading 生成） */}
-        <aside className="sf-scroll w-52 shrink-0 space-y-0.5 overflow-y-auto border-r border-border bg-bg-subtle px-3 py-4">
+        {/* TOC（问题8：点击跳转 + 滚动联动高亮 + 自动居中） */}
+        <aside
+          ref={tocAsideRef}
+          className="sf-scroll w-52 shrink-0 space-y-0.5 overflow-y-auto border-r border-border bg-bg-subtle px-3 py-4"
+        >
           <div className="flex items-center justify-between gap-1 pb-2">
             <span className="text-[11px] font-semibold text-text-muted">目录 · TOC</span>
-            {toc.length > 0 && (
-              <button
-                onClick={() => createSectionTasks.mutate()}
-                disabled={createSectionTasks.isPending}
-                title="把每个章节列成 Task，在右侧进度区逐步完成"
-                className="shrink-0 rounded border border-border px-1.5 py-0.5 text-[10px] text-text-secondary hover:bg-border/40 disabled:opacity-50"
-              >
-                {createSectionTasks.isPending ? "建任务…" : "＋建任务"}
-              </button>
-            )}
           </div>
           {toc.length === 0 ? (
             <p className="px-2 text-[11px] text-text-muted">暂无目录（文档无标题）</p>
           ) : (
-            toc.map((t) => (
-              <button
-                key={t.id}
-                onClick={() =>
-                  document
-                    .getElementById(t.id)
-                    ?.scrollIntoView({ behavior: "smooth", block: "start" })
-                }
-                className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left hover:bg-primary-subtle/60"
-                style={{ paddingLeft: 8 + (t.level - 1) * 12 }}
-                title={t.label}
-              >
-                <span
+            toc.map((t, i) => {
+              const isActive = activeIdx === i;
+              return (
+                <button
+                  key={`${i}-${t.id}`}
+                  data-tocidx={i}
+                  onClick={() => {
+                    // 点击即高亮并把文档容器滚动到第 i 个标题（索引定位，问题2-1）
+                    setActiveIdx(i);
+                    scrollToHeading(i);
+                  }}
                   className={cn(
-                    "truncate text-xs",
-                    t.level > 1 ? "text-text-muted" : "text-text-secondary"
+                    "flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left transition-colors hover:bg-primary-subtle/60",
+                    isActive && "bg-primary-subtle"
                   )}
+                  style={{ paddingLeft: 8 + (t.level - 1) * 12 }}
+                  title={t.label}
                 >
-                  {t.label}
-                </span>
-              </button>
-            ))
+                  <span
+                    className={cn(
+                      "truncate text-xs",
+                      isActive
+                        ? "font-semibold text-primary"
+                        : t.level > 1
+                        ? "text-text-muted"
+                        : "text-text-secondary"
+                    )}
+                  >
+                    {t.label}
+                  </span>
+                </button>
+              );
+            })
           )}
         </aside>
 
-        {/* 文档主体：根据 view 切换 渲染/源码/Diff */}
-        <div className="sf-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-10 py-6">
+        {/* 文档主体：根据 view 切换 渲染/源码/Diff（ref 供 TOC 在本容器内精准滚动） */}
+        <div
+          ref={docScrollRef}
+          className="sf-scroll relative flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-10 py-6"
+        >
           {isLoading ? (
             <p className="text-sm text-text-muted">加载工件…</p>
           ) : !artifact ? (
@@ -638,6 +941,12 @@ export function RequirementView() {
             <textarea
               value={shown}
               onChange={(e) => {
+                // 把改动前的值压入撤销栈（与栈顶去重，避免连续输入塞满）
+                const prev = shown;
+                setHistory((h) =>
+                  h.length > 0 && h[h.length - 1] === prev ? h : [...h, prev]
+                );
+                setRedo([]); // 新编辑产生新分支，清空重做栈（问题7）
                 setDraft(e.target.value);
                 setDirty(true);
               }}
@@ -668,19 +977,45 @@ export function RequirementView() {
                 </p>
               );
             })()
-          ) : hasPendingHighlight && ownPending ? (
-            // 渲染态行内高亮：新增/修改/删除就近凸显，逐块确认后消失
+          ) : useInlineHighlight && ownPending ? (
+            // 渲染态行内高亮：以「修改后全文」(highlightContent) 为底稿，使改动准确高亮在原文位置（问题1A）
             <InlineHighlightView
-              content={shown}
+              content={highlightContent}
               blocks={ownPending.diffBlocks!}
               cid={ownPending.id}
               onResolve={refreshAll}
               onGoDiff={() => setView("diff")}
             />
           ) : (
-            <article className="prose prose-sm max-w-none text-text">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>{shown}</ReactMarkdown>
-            </article>
+            <>
+              {/* 块数过多（大文档）：跳过行内高亮以保证流畅，提示去并排 Diff 逐块确认 */}
+              {hasPendingHighlight && ownPending && (
+                <button
+                  onClick={() => setView("diff")}
+                  className="flex w-full items-center gap-2 rounded-md border border-pending bg-warning-subtle px-3 py-1.5 text-left text-xs font-medium text-warning hover:bg-warning-subtle/70"
+                >
+                  🟡 本次有 {pendingBlockCount} 处待确认改动，文档较大已切换为普通渲染以保证流畅；点此到「并排 Diff」逐块确认，或用上方「全部确认 / 全部拒绝」。
+                </button>
+              )}
+              <article
+                ref={articleRef}
+                onMouseUp={onArticleMouseUp}
+                className="prose prose-sm max-w-none text-text"
+              >
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{shown}</ReactMarkdown>
+              </article>
+            </>
+          )}
+
+          {/* 问题3：划选引用浮动按钮（仅渲染态、有选区时出现，点击把片段引用到对话框） */}
+          {view === "render" && quoteBtn && (
+            <button
+              onClick={applyQuote}
+              className="absolute z-30 inline-flex items-center gap-1 rounded-md border border-primary bg-primary px-2 py-1 text-[11px] font-medium text-white shadow-lg hover:bg-primary/90"
+              style={{ top: quoteBtn.top, left: quoteBtn.left }}
+            >
+              <Quote className="h-3 w-3" /> ✎ 引用到对话框修改
+            </button>
           )}
         </div>
       </div>

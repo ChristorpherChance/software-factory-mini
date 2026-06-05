@@ -36,21 +36,51 @@ export function useSseStream(sid: string | null) {
 
     const es = new EventSource(`${SSE_BASE}/sessions/${sid}/stream`);
 
+    // 性能关键（修复大文档生成时全页面卡死）：每个 message.delta 是独立事件循环回合，
+    // 不会被 React 18 自动批处理 → 大文档可达上千次 setState/重渲染而卡死。
+    // 用 requestAnimationFrame 把同一帧内的多段增量合并为一次 appendDelta。
+    const deltaBuf = new Map<string, string>();
+    let rafId = 0;
+    const flushDeltas = () => {
+      rafId = 0;
+      if (deltaBuf.size === 0) return;
+      const entries = Array.from(deltaBuf.entries());
+      deltaBuf.clear();
+      for (const [id, txt] of entries) sess.appendDelta(id, txt);
+    };
+
     const route = (type: string, data: any) => {
       switch (type) {
-        case "message.delta":
-          sess.appendDelta(data.msg_id, data.delta ?? "");
+        case "message.delta": {
+          const id = data.msg_id;
+          deltaBuf.set(id, (deltaBuf.get(id) ?? "") + (data.delta ?? ""));
+          if (typeof requestAnimationFrame === "undefined") {
+            flushDeltas(); // 极端兜底：无 rAF 环境直接刷新
+          } else if (!rafId) {
+            rafId = requestAnimationFrame(flushDeltas);
+          }
           break;
+        }
         case "message.end":
+          // 结束前先把缓冲的增量落定，保证最终内容完整
+          if (rafId) {
+            cancelAnimationFrame(rafId);
+            rafId = 0;
+          }
+          flushDeltas();
           sess.finalize(data.msg_id);
           // 流式结束：工件可能已生成/更新，刷新主区相关查询，使内容自动显示
           qc.invalidateQueries({ queryKey: ["artifacts"] });
           qc.invalidateQueries({ queryKey: ["artifact"] });
           qc.invalidateQueries({ queryKey: ["pending-changes"] });
           qc.invalidateQueries({ queryKey: ["rtm"] });
+          // 自动拆解任务在生成结束后可能被清除：刷新 task 列表使 TaskProgress 收起（问题6）
+          qc.invalidateQueries({ queryKey: ["tasks"] });
           break;
         case "task.update":
           task.update(data.task_id, data.status, data.progress);
+          // 后端新建/删除步骤任务实时反映到 TaskProgress（生成中出现、完成后消失，问题6）
+          qc.invalidateQueries({ queryKey: ["tasks"] });
           break;
         case "artifact.created":
           art.markCreated(data.artifact_url);
@@ -59,6 +89,8 @@ export function useSseStream(sid: string | null) {
           qc.invalidateQueries({ queryKey: ["artifacts"] });
           qc.invalidateQueries({ queryKey: ["artifact"] });
           qc.invalidateQueries({ queryKey: ["rtm"] });
+          // 定向编辑确认会落新版本并解除 pending：同步刷新 pending 列表，使行内高亮消失、显示已应用的最新内容（问题1B）
+          qc.invalidateQueries({ queryKey: ["pending-changes"] });
           break;
         case "hitl.request":
           sess.raiseHitl(data);
@@ -101,6 +133,8 @@ export function useSseStream(sid: string | null) {
     es.onerror = () => useSessionStore.getState().setConnState("reconnecting");
 
     return () => {
+      if (rafId && typeof cancelAnimationFrame !== "undefined") cancelAnimationFrame(rafId);
+      flushDeltas(); // 卸载/切会话前落定残留增量，避免丢尾
       handlers.forEach(({ t, h }) => es.removeEventListener(t, h as EventListener));
       es.close();
       useSessionStore.getState().setConnState("closed");

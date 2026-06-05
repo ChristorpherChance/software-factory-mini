@@ -28,6 +28,8 @@ interface SessionState {
   appendDelta: (id: string, delta: string) => void;
   /** SSE message.end：结束流式态。 */
   finalize: (id: string) => void;
+  /** 用户点「停止」：立即停掉该消息流式态，并忽略其后续 SSE 增量（问题1 立即停止、不再输出）。 */
+  cancelStream: (id: string) => void;
   /** SSE hitl.request：把 pending 信息挂到对应消息上。 */
   raiseHitl: (data: {
     pending_change_id: string;
@@ -41,15 +43,19 @@ interface SessionState {
   reset: () => void;
 }
 
-export const useSessionStore = create<SessionState>((set) => ({
+export const useSessionStore = create<SessionState & { stopped: Record<string, boolean> }>((set) => ({
   sid: null,
   messages: [],
   connState: "closed",
+  // 已停止的消息 id（内存态，切会话清空）；停止后 appendDelta 直接忽略其增量
+  stopped: {},
   setSid: (sid) => set({ sid }),
   hydrate: (messages) => set({ messages }),
   push: (msg) => set((st) => ({ messages: [...st.messages, msg] })),
   appendDelta: (id, delta) =>
     set((st) => {
+      // 已被用户停止的消息：忽略后续增量，保持已输出内容不再增长（问题1）
+      if (st.stopped[id]) return {};
       const i = st.messages.findIndex((m) => m.id === id);
       if (i < 0) {
         return {
@@ -65,6 +71,11 @@ export const useSessionStore = create<SessionState>((set) => ({
     }),
   finalize: (id) =>
     set((st) => ({
+      messages: st.messages.map((m) => (m.id === id ? { ...m, streaming: false } : m)),
+    })),
+  cancelStream: (id) =>
+    set((st) => ({
+      stopped: { ...st.stopped, [id]: true },
       messages: st.messages.map((m) => (m.id === id ? { ...m, streaming: false } : m)),
     })),
   raiseHitl: (data) =>
@@ -89,5 +100,5 @@ export const useSessionStore = create<SessionState>((set) => ({
       };
     }),
   setConnState: (connState) => set({ connState }),
-  reset: () => set({ messages: [], connState: "closed" }),
+  reset: () => set({ messages: [], connState: "closed", stopped: {} }),
 }));

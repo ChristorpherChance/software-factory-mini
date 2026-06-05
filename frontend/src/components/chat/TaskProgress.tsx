@@ -112,6 +112,7 @@ export function TaskProgress() {
 
   const done = enriched.filter((t) => mapStatus(t.status) === "done").length;
   const total = enriched.length;
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
 
   // 没有任何 task 时直接不渲染（避免占空间）
   if (total === 0) return null;
@@ -136,8 +137,17 @@ export function TaskProgress() {
         </span>
       </button>
 
+      {/* 细总进度条（done/total 百分比） */}
+      <div className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-bg-subtle">
+        <div
+          className="h-full rounded-full bg-success transition-[width]"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+
       {open && (
-        <div className="mt-1.5 space-y-0.5">
+        // 任务很多时（后端自动拆解可能产生多条）限高 + 内部滚动，避免撑破对话区
+        <div className="mt-1.5 max-h-[40vh] space-y-0.5 overflow-y-auto sf-scroll">
           {GROUPS.map((g) => {
             const items = enriched.filter((t) => mapStatus(t.status) === g.key);
             if (!items.length) return null;

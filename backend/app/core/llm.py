@@ -15,6 +15,7 @@ import json
 
 from ..config import settings
 from .prompt_ctx import get_active_prompt
+from .model_ctx import get_active_model
 
 # 资料结构化输出 schema（骨架 §5.2 / M1 §7.3）
 MATERIAL_SCHEMA = {
@@ -395,6 +396,66 @@ async def _pi_requirement(kind: str, upstream: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 通用 OpenAI 兼容调用（多模型选择驱动生成，问题2）
+# 覆盖 Ollama /v1、DeepSeek、qwen 兼容模式，以及多数 OpenAI 兼容的第三方代理。
+# 铁律#3：调用方负责异常回落 stub，本函数只管发请求/解析。
+# ---------------------------------------------------------------------------
+async def _openai_chat(
+    system: str,
+    user: str,
+    model: str,
+    base_url: str,
+    api_key: str | None,
+    temperature: float = 0.2,
+) -> str:
+    import httpx
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": temperature,
+        "stream": False,
+    }
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    async with httpx.AsyncClient(timeout=_PI_TIMEOUT) as c:
+        r = await c.post(url, json=payload, headers=headers)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+
+
+async def _anthropic_requirement_with(
+    kind: str, upstream: str, model: str, api_key: str, base_url: str | None = None
+) -> str:
+    """用会话级覆盖的 client/model 调 Claude（多模型选择，问题2）。
+
+    与 _anthropic_requirement 同构，但接收覆盖的 api_key/model/base_url，不发 tool.call SSE。
+    异常向上抛，由调用方回落（铁律#3）。"""
+    from anthropic import AsyncAnthropic
+
+    client = AsyncAnthropic(api_key=api_key, base_url=base_url) if base_url else AsyncAnthropic(api_key=api_key)
+    resp = await client.messages.create(
+        model=model or settings.llm_model,
+        max_tokens=8192,
+        temperature=0.2,
+        system=get_active_prompt(f"requirement.{kind.lower()}") or _REQ_PROMPT[kind.lower()],
+        messages=[{"role": "user", "content": upstream}],
+    )
+    return "".join(b.text for b in resp.content if b.type == "text")
+
+
+_EDIT_SYSTEM = (
+    "你是需求文档编辑器。只按指令修改对应条目，保持其它所有内容逐字不变，"
+    "输出完整的修改后文档（Markdown）。"
+)
+
+
+# ---------------------------------------------------------------------------
 # 统一入口
 # ---------------------------------------------------------------------------
 async def structure_material(text: str, session_id: str | None = None) -> dict:
@@ -416,6 +477,28 @@ async def structure_material(text: str, session_id: str | None = None) -> dict:
 
 
 async def generate_requirement(kind: str, upstream: str, session_id: str | None = None) -> str:
+    # 多模型选择优先（问题2）：会话级 model.name 覆盖 → 解析出的端点 dict。
+    m = get_active_model()
+    if m and m.get("base_url") and m.get("provider") not in (None, "stub", "anthropic"):
+        try:
+            system = get_active_prompt(f"requirement.{kind.lower()}") or _REQ_PROMPT[kind.lower()]
+            out = await _openai_chat(
+                system, upstream, m.get("model") or settings.llm_model, m["base_url"], m.get("api_key")
+            )
+            if out and out.strip():
+                return out
+        except Exception:
+            pass  # 回落到下方默认分流（铁律#3）
+    elif m and m.get("provider") == "anthropic" and m.get("api_key"):
+        try:
+            out = await _anthropic_requirement_with(
+                kind, upstream, m.get("model") or settings.llm_model, m["api_key"], m.get("base_url")
+            )
+            if out and out.strip():
+                return out
+        except Exception:
+            pass
+
     if settings.llm_provider == "pi":
         try:
             return await _pi_requirement(kind, upstream)
@@ -464,13 +547,32 @@ async def beautify_prompt(draft: str) -> str:
     return _stub_beautify(draft)
 
 
-def _stub_edit(current_doc: str, instruction: str) -> str:
-    """离线兜底的定向编辑（问题2）：解析「把 <编号> 改成/为 <新文案>」，只替换该条整行。
+def _stub_edit(current_doc: str, instruction: str, quote: str | None = None) -> str:
+    """离线兜底的定向编辑（问题2/3）：解析「把 <编号> 改成/为 <新文案>」，只替换该条整行。
 
     支持：改成/改为/替换为 → 替换该编号行标题；删除 <编号> → 删除该行。其余原样返回。
     确定性、无 LLM，保证 stub/CI 可跑通按块 diff。
+
+    划选引用（问题3）：当 quote 命中文档时，直接对该被引用片段做定向最小改动：
+    - 含「删除/去掉」→ 从文档移除该片段；
+    - 含「改成/改为/替换为/更新为/为 X」→ 用 X 替换该片段；
+    - 其余 → 原文不变（上层据 old==new 提示「未能定位」）。
+    quote 未命中或为空 → 回落到下方编号解析逻辑。
     """
     import re as _re
+
+    # 划选引用片段优先（问题3）：只改这一段，其余逐字不变。
+    q = (quote or "").strip()
+    if q and q in current_doc:
+        if any(k in instruction for k in ("删除", "去掉")):
+            return current_doc.replace(q, "")
+        m_new = _re.search(
+            r"(?:改成|改为|替换为|更新为|为)\s*[:：]?\s*(.+)$", instruction
+        )
+        if m_new:
+            new_text = m_new.group(1).strip()
+            return current_doc.replace(q, new_text)
+        return current_doc  # 无可识别的替换文案 → 不改（上层提示未能定位）
 
     code_pat = r"(R-\d+|CR-\d+|PRD-[A-Z]+-\d+|PRD-\d+)"
     m_code = _re.search(code_pat, instruction)
@@ -523,13 +625,142 @@ async def _pi_edit(current_doc: str, instruction: str, prompt_override: str | No
 
 
 async def edit_requirement(
-    current_doc: str, instruction: str, prompt_override: str | None = None
+    current_doc: str,
+    instruction: str,
+    prompt_override: str | None = None,
+    quote: str | None = None,
 ) -> str:
-    """定向编辑（问题2）非流式入口：pi 调 agent-service；其它回落 stub。"""
+    """定向编辑（问题2/3）非流式入口：会话级模型选择优先 → pi → stub 回落。
+
+    quote（问题3）：用户在主区划选并引用的原文片段。提供时给真实模型强调
+    「只修改这段被引用的原文，其余逐字不变」，stub 路径据 quote 做定向最小改动。"""
+    # 多模型选择优先（问题2）
+    m = get_active_model()
+    q = (quote or "").strip()
+    sys = _EDIT_SYSTEM + (f"\n领域提示词：{prompt_override}" if prompt_override else "")
+    if q:
+        user = (
+            f"【当前完整文档】\n{current_doc}\n\n"
+            f"【仅修改这段被引用的原文】\n{q}\n\n"
+            f"【修改要求】\n{instruction}"
+        )
+    else:
+        user = f"【当前完整文档】\n{current_doc}\n\n【修改指令】\n{instruction}"
+    if m and m.get("base_url") and m.get("provider") not in (None, "stub", "anthropic"):
+        try:
+            out = await _openai_chat(
+                sys, user, m.get("model") or settings.llm_model, m["base_url"], m.get("api_key")
+            )
+            if out and out.strip():
+                return out
+        except Exception:
+            pass  # 回落（铁律#3）
+    elif m and m.get("provider") == "anthropic" and m.get("api_key"):
+        try:
+            from anthropic import AsyncAnthropic
+
+            client = (
+                AsyncAnthropic(api_key=m["api_key"], base_url=m["base_url"])
+                if m.get("base_url")
+                else AsyncAnthropic(api_key=m["api_key"])
+            )
+            resp = await client.messages.create(
+                model=m.get("model") or settings.llm_model,
+                max_tokens=8192,
+                temperature=0.2,
+                system=sys,
+                messages=[{"role": "user", "content": user}],
+            )
+            out = "".join(b.text for b in resp.content if b.type == "text")
+            if out and out.strip():
+                return out
+        except Exception:
+            pass
+
     if settings.llm_provider == "pi":
         try:
-            out = await _pi_edit(current_doc, instruction, prompt_override)
-            return out if (out and out.strip()) else _stub_edit(current_doc, instruction)
+            # 划选引用（问题3）：把引用片段拼进指令约束 pi 只改这一段。
+            pi_instr = instruction
+            if q:
+                pi_instr = f"（仅修改下面这段被引用的原文，其余逐字不变：{q}）\n{instruction}"
+            out = await _pi_edit(current_doc, pi_instr, prompt_override)
+            return out if (out and out.strip()) else _stub_edit(current_doc, instruction, quote)
         except Exception:
-            return _stub_edit(current_doc, instruction)
-    return _stub_edit(current_doc, instruction)
+            return _stub_edit(current_doc, instruction, quote)
+    return _stub_edit(current_doc, instruction, quote)
+
+
+# ---------------------------------------------------------------------------
+# 对话回答（问题3）：用户输入经路由判为"对话/提问"时，给出对话式回答而非整篇重写。
+# 有会话级模型/anthropic 则真对话；stub 离线兜底为明确指引（绝不重写文档）。
+# ---------------------------------------------------------------------------
+_CHAT_SYSTEM = (
+    "你是需求文档助理。请直接、简洁地回答用户关于当前文档的问题或与其对话；"
+    "绝不要输出或整篇重写文档。若用户想改文档，请提示其用「在主区划选文本→引用到对话框」"
+    "或发送明确的修改指令（如「把 CR-003 改为…」）。"
+)
+
+_CHAT_FALLBACK = (
+    "已收到你的消息（我不会整篇重写文档）。\n"
+    "· 想修改某处：在主内容区划选该段文字 →「✎ 引用到对话框修改」→ 描述修改要求；\n"
+    "· 想全新生成：点右上「生成 / 重新生成」，或发送如「生成 CRD」「重新生成 PRD」。"
+)
+
+
+async def chat_reply(user_text: str, doc_context: str = "") -> str:
+    """对话式回答：会话级模型优先 → anthropic → stub 兜底指引。绝不重写文档。"""
+    user = (
+        f"【当前文档（节选）】\n{doc_context[:3000]}\n\n" if doc_context else ""
+    ) + f"【用户消息】\n{user_text}"
+    m = get_active_model()
+    # 会话级 OpenAI 兼容端点（Ollama/DeepSeek/qwen/第三方代理）
+    if m and m.get("base_url") and m.get("provider") not in (None, "stub", "anthropic"):
+        try:
+            out = await _openai_chat(
+                _CHAT_SYSTEM, user, m.get("model") or settings.llm_model, m["base_url"], m.get("api_key"), temperature=0.3
+            )
+            if out and out.strip():
+                return out
+        except Exception:
+            pass
+    # 会话级 anthropic 覆盖
+    elif m and m.get("provider") == "anthropic" and m.get("api_key"):
+        try:
+            from anthropic import AsyncAnthropic
+
+            client = (
+                AsyncAnthropic(api_key=m["api_key"], base_url=m["base_url"])
+                if m.get("base_url")
+                else AsyncAnthropic(api_key=m["api_key"])
+            )
+            resp = await client.messages.create(
+                model=m.get("model") or settings.llm_model,
+                max_tokens=2048,
+                temperature=0.3,
+                system=_CHAT_SYSTEM,
+                messages=[{"role": "user", "content": user}],
+            )
+            out = "".join(b.text for b in resp.content if b.type == "text")
+            if out and out.strip():
+                return out
+        except Exception:
+            pass
+    # 全局 anthropic
+    elif settings.llm_provider == "anthropic" and settings.llm_api_key:
+        try:
+            from anthropic import AsyncAnthropic
+
+            client = AsyncAnthropic(api_key=settings.llm_api_key)
+            resp = await client.messages.create(
+                model=settings.llm_model,
+                max_tokens=2048,
+                temperature=0.3,
+                system=_CHAT_SYSTEM,
+                messages=[{"role": "user", "content": user}],
+            )
+            out = "".join(b.text for b in resp.content if b.type == "text")
+            if out and out.strip():
+                return out
+        except Exception:
+            pass
+    return _CHAT_FALLBACK

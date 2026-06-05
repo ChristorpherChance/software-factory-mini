@@ -170,6 +170,13 @@ async def approve(cid: str, db: AsyncSession = Depends(get_db), actor=Depends(re
     db.add(HitlDecision(pending_change_id=c.id, decision="approve", decided_by=actor["actor"]))
     await db.commit()
     await publish(str(c.project_id), "task.update", {"task_id": str(c.id), "status": "approved"})
+    # 定向编辑/工件更新确认后会落新版本：广播 artifact.created，使主区工件查询失效并刷新到最新版（问题1B）
+    if c.target_type == "artifact" and c.target_id:
+        await publish(
+            str(c.project_id),
+            "artifact.created",
+            {"artifact_url": str(c.target_id), "kind": (c.diff or {}).get("type", "")},
+        )
     return ok({"approved": True})
 
 
@@ -286,6 +293,13 @@ async def resolve_block(
         await publish(
             str(c.project_id), "task.update", {"task_id": str(c.id), "status": "approved"}
         )
+        # 按块确认聚合为 approved 后同样落了新版本：广播 artifact.created 刷新主区到最新版（问题1B）
+        if c.target_type == "artifact" and c.target_id:
+            await publish(
+                str(c.project_id),
+                "artifact.created",
+                {"artifact_url": str(c.target_id), "kind": (c.diff or {}).get("type", "")},
+            )
     return ok(
         {
             "resolved": True,

@@ -118,7 +118,10 @@ async def _pi_ws_generate(
 async def _pi_ws_edit(
     sid: str, current_doc: str, instruction: str, prompt_override: str | None, aid: str
 ) -> str:
-    """定向编辑（问题2）真 token 流式：走 agent-service WS `edit` 通道，逐 token 推送修改后全文。
+    """定向编辑（问题5）真 token 流式：走 agent-service WS `edit` 通道，聚合修改后全文。
+
+    关键修复：**不再把每个 token 作为 message.delta 推进对话框**（避免「改一处刷整篇」），
+    edit 通道仅聚合完整 new_md 供上层建 pending；简短说明由调用方在建好 pending 后单独推送。
     返回完整修改后文档；空流/异常向上抛，由调用方回落（铁律#3）。"""
     import httpx
     from httpx_ws import aconnect_ws
@@ -149,10 +152,7 @@ async def _pi_ws_edit(
             if t == "message.delta":
                 delta = ev.get("text", "")
                 if delta:
-                    buf += delta
-                    await publish(
-                        sid, "message.delta", {"msg_id": aid, "delta": delta, "role": "assistant"}
-                    )
+                    buf += delta  # 仅聚合，不 publish 给前端（不刷整篇）
             elif t == "tool.call":
                 await publish(sid, "tool.call", ev)
             elif t == "message.end":
@@ -180,6 +180,7 @@ async def _run_orchestrator(
     references: list[str] | None = None,
     target_type: str | None = None,
     target_artifact_id: str | None = None,
+    quote: str | None = None,
 ):
     """后台任务：独立 DB session 跑编排，逐 token publish。
 
@@ -203,6 +204,9 @@ async def _run_orchestrator(
         if settings.llm_provider == "pi":
             orch = Orchestrator(db)
             intent = orch._route(user_text)
+            # 划选引用（问题3）：有引用片段则强制按定向编辑处理（parse_material 除外）。
+            if quote and quote.strip() and intent != "parse_material":
+                intent = "edit"
             if intent == "chat":
                 try:
                     buf = await _pi_ws_stream(sid, user_text, aid)
@@ -234,18 +238,40 @@ async def _run_orchestrator(
                         prompt_override = (await load_active_prompts(db)).get(f"requirement.{kind}")
                     except Exception:  # noqa: BLE001
                         pass
-                    new_md = await _pi_ws_edit(sid, old_md, user_text, prompt_override, aid)
+                    # 划选引用（问题3）：把被引用原文拼进指令，约束模型只改这一段。
+                    instr = user_text
+                    if quote and quote.strip():
+                        instr = f"（仅修改下面这段被引用的原文，其余逐字不变：{quote.strip()}）\n{user_text}"
+                    new_md = await _pi_ws_edit(sid, old_md, instr, prompt_override, aid)
+                    if new_md == old_md:
+                        # 未定位到改动 → 回落本地 handle 给出指引（不整篇覆盖）
+                        raise RuntimeError("edit produced no change")
                     # 定位目标工件 id（前端传的优先，否则取最新同类型）
                     tid = target_artifact_id
                     if not tid and pid:
                         art = await latest_artifact(db, pid, kind)
                         tid = str(art.id) if art else None
+                    pc = None
                     if pid:
-                        await orch._save_edit_pending(
+                        pc = await orch._save_edit_pending(
                             pid, kind, tid, old_md, new_md, sid, hitl
                         )
-                    # 对话区已流式显示修改后全文（new_md=buf）；落库该助手消息内容即流式内容。
-                    assistant.content, assistant.status = new_md, "completed"
+                    # 仅推送简短说明（不把整篇 new_md 刷进对话框，问题5）。
+                    from ...agents.orchestrator.state_machine import _to_diff_blocks_update
+
+                    n = (
+                        len(pc.diff_blocks)
+                        if (pc and pc.diff_blocks)
+                        else len(_to_diff_blocks_update(old_md, new_md))
+                    )
+                    note = (
+                        f"已在「{kind.upper()}」中定位并生成 {n} 处改动，"
+                        "请在主区逐块确认（不会整篇覆盖原文）。"
+                    )
+                    await publish(
+                        sid, "message.delta", {"msg_id": aid, "delta": note, "role": "assistant"}
+                    )
+                    assistant.content, assistant.status = note, "completed"
                     await db.commit()
                     await publish(sid, "message.end", {"msg_id": aid, "finish_reason": "stop"})
                     return
@@ -292,13 +318,34 @@ async def _run_orchestrator(
             # 其它意图或上面回落：落到下方 Orchestrator.handle（薄监督器，含落库）
 
         try:
-            async for delta in Orchestrator(db).handle(sid, user_text, hitl_mode, references):
+            n = 0  # 协作式取消（问题5）：每若干段回查本消息状态，被置 cancelled 即停。
+            async for delta in Orchestrator(db).handle(
+                sid, user_text, hitl_mode, references, target_type, target_artifact_id, quote
+            ):
                 buf += delta
                 await publish(
                     sid,
                     "message.delta",
                     {"msg_id": aid, "delta": delta, "role": "assistant"},
                 )
+                n += 1
+                if n % 5 == 0:
+                    # 重新读取本 assistant 消息状态：cancel 端点置 cancelled → 协作停止。
+                    await db.refresh(assistant)
+                    if assistant.status == "cancelled":
+                        assistant.content = buf  # 保留已输出内容
+                        await db.commit()
+                        await publish(
+                            sid, "message.end", {"msg_id": aid, "finish_reason": "cancelled"}
+                        )
+                        return
+            # 收尾再判一次：避免最后几段后被取消却仍标 completed。
+            await db.refresh(assistant)
+            if assistant.status == "cancelled":
+                assistant.content = buf
+                await db.commit()
+                await publish(sid, "message.end", {"msg_id": aid, "finish_reason": "cancelled"})
+                return
             assistant.content, assistant.status = buf, "completed"
             await db.commit()
             await publish(sid, "message.end", {"msg_id": aid, "finish_reason": "stop"})
@@ -339,9 +386,10 @@ async def send(
     references = body.get("references") or None
     target_type = body.get("targetType")
     target_artifact_id = body.get("targetArtifactId")
+    quote = body.get("quote") or None  # 划选引用片段（问题3）：据此走定向最小改动。
     asyncio.create_task(
         _run_orchestrator(
-            sid, body["content"], hitl, references, target_type, target_artifact_id
+            sid, body["content"], hitl, references, target_type, target_artifact_id, quote
         )
     )
     return idem_put(idem, ok(_dto(m)))

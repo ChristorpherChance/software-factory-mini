@@ -2,11 +2,12 @@
 
 import { useEffect } from "react";
 import { useRouter, useParams, useSearchParams } from "next/navigation";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, X, RotateCw, FileText } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, type PendingChangeDto } from "@/lib/api";
 import { useSessionStore } from "@/stores/session";
 import { useHitlStore } from "@/stores/hitl";
+import { useEditTargetStore } from "@/stores/editTarget";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -27,6 +28,27 @@ export function PendingActions({ cid, count }: { cid: string; count: number }) {
   const sid = useSessionStore((s) => s.sid);
   const push = useSessionStore((s) => s.push);
   const mode = useHitlStore((s) => s.mode);
+  // 定向编辑/重生定位目标（与主区当前工件联动）
+  const editTargetType = useEditTargetStore((s) => s.targetType);
+  const editTargetId = useEditTargetStore((s) => s.targetArtifactId);
+
+  // 实时读取该 pending 的最新状态（问题2：与主区按块确认双向联动）。
+  // queryKey 以 "pending-changes" 开头，任何地方 invalidate(["pending-changes"]) 都会刷新它；
+  // 已总定（非 pending）则停止轮询。
+  const { data: live } = useQuery({
+    queryKey: ["pending-changes", "one", cid],
+    queryFn: () => api.pendingChange(cid),
+    enabled: !!cid,
+    refetchInterval: (q: any) =>
+      q.state.data?.status && q.state.data.status !== "pending" ? false : 3000,
+  });
+  const liveBlocks = (live?.diffBlocks ?? []) as PendingChangeDto["diffBlocks"];
+  // 剩余待确认数：有切块用块统计，否则回落初始 count
+  const remaining =
+    liveBlocks && liveBlocks.length
+      ? liveBlocks.filter((b) => b.state === "pending").length
+      : count;
+  const liveStatus = live?.status ?? "pending";
 
   const refresh = () => {
     qc.invalidateQueries({ queryKey: ["artifact"] });
@@ -44,7 +66,10 @@ export function PendingActions({ cid, count }: { cid: string; count: number }) {
     onSuccess: refresh,
   });
 
-  const done = approve.isSuccess || reject.isSuccess;
+  // 完成态：本地确认/拒绝成功，或后端状态已总定（主区按块全部确认/拒绝也会令其总定）。
+  const approved = approve.isSuccess || liveStatus === "approved";
+  const rejected = reject.isSuccess || liveStatus === "rejected";
+  const done = approved || rejected;
 
   // D 联动主区 Diff：跳到 /p/{pid}/requirement/main?view=diff
   const goDiff = () => {
@@ -60,7 +85,10 @@ export function PendingActions({ cid, count }: { cid: string; count: number }) {
     const content = "重新生成";
     push({ id: `local-${Date.now()}`, role: "user", content });
     try {
-      await api.send(sid, content, mode);
+      await api.send(sid, content, mode, undefined, {
+        targetType: editTargetType,
+        targetArtifactId: editTargetId,
+      });
     } catch {
       /* 静默；SSE 推结果 */
     }
@@ -85,7 +113,7 @@ export function PendingActions({ cid, count }: { cid: string; count: number }) {
   if (done) {
     return (
       <div className="mt-1 rounded-md border border-border bg-bg-subtle px-3 py-2 text-xs text-text-secondary">
-        {approve.isSuccess ? "✓ 已确认 · 已入 .git" : "✗ 已弃用"}
+        {approved ? "✓ 已确认 · 已入 .git" : "✗ 已弃用"}
       </div>
     );
   }
@@ -94,7 +122,7 @@ export function PendingActions({ cid, count }: { cid: string; count: number }) {
     <div className="mt-1 space-y-2 rounded-md border border-pending bg-warning-subtle p-3">
       <div className="flex items-center justify-between">
         <span className="text-xs font-semibold text-warning">
-          🟡 待确认 · 剩余 {count > 0 ? count : "—"} 处
+          🟡 待确认 · 剩余 {remaining > 0 ? remaining : "—"} 处
         </span>
         <span className="text-[11px] text-text-muted">快捷键 Y / N / R / D</span>
       </div>
@@ -107,7 +135,7 @@ export function PendingActions({ cid, count }: { cid: string; count: number }) {
           disabled={approve.isPending}
           title="Y 确认"
         >
-          <Check className={cn("h-3.5 w-3.5")} /> 确认修改{count > 0 ? `【${count}】` : ""}
+          <Check className={cn("h-3.5 w-3.5")} /> 确认修改{remaining > 0 ? `【${remaining}】` : ""}
         </Button>
         <Button
           variant="outline"

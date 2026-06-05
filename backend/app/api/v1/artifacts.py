@@ -224,6 +224,52 @@ async def submit_version(
     return ok({"id": aid, "version": nv})
 
 
+@router.post("/projects/{pid}/artifacts/{aid}/finalize")
+async def finalize(
+    pid: str,
+    aid: str,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_auth),
+):
+    """工件定稿（问题6）：置 status=finalized、version+1，publish artifact.created。
+
+    PRD 生成时优先取「已定稿」CRD 作上游，故 CRD 定稿后下游可联动。"""
+    a = await db.get(Artifact, aid)
+    if not a or a.project_id != pid:
+        raise AppError(404, "artifact not found")
+    a.status = "finalized"
+    a.version = a.version + 1
+    await db.commit()
+    try:
+        await publish(str(pid), "artifact.created", {"artifact_url": str(a.id), "kind": a.type})
+    except Exception:
+        pass
+    return ok({"id": aid, "status": "finalized"})
+
+
+@router.post("/projects/{pid}/artifacts/{aid}/unfinalize")
+async def unfinalize(
+    pid: str,
+    aid: str,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_auth),
+):
+    """解锁定稿（问题9）：status 置回 "draft"、version+1，publish artifact.created。
+
+    与 finalize 对称：解锁后可继续编辑/重生成下游联动恢复为「未定稿」状态。"""
+    a = await db.get(Artifact, aid)
+    if not a or a.project_id != pid:
+        raise AppError(404, "artifact not found")
+    a.status = "draft"
+    a.version = a.version + 1
+    await db.commit()
+    try:
+        await publish(str(pid), "artifact.created", {"artifact_url": str(a.id), "kind": a.type})
+    except Exception:
+        pass
+    return ok({"id": aid, "status": "draft"})
+
+
 @router.post("/artifacts/{aid}/rollback")
 async def rollback(aid: str, body: dict, db: AsyncSession = Depends(get_db), _=Depends(require_auth)):
     target = body["toVersion"]

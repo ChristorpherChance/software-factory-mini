@@ -16,6 +16,9 @@ interface SettingState {
   setChatWidth: (w: number) => void;
   l2Collapsed: boolean;
   toggleL2: () => void;
+  // 对话区收拢态（问题4）：收拢后整列宽 0、不渲染 ChatPanel，右下角悬浮小人按钮可展开
+  chatCollapsed: boolean;
+  setChatCollapsed: (b: boolean) => void;
 }
 
 export const useSettingStore = create<SettingState>()(
@@ -31,6 +34,9 @@ export const useSettingStore = create<SettingState>()(
 
       l2Collapsed: false,
       toggleL2: () => set((s) => ({ l2Collapsed: !s.l2Collapsed })),
+
+      chatCollapsed: false,
+      setChatCollapsed: (b) => set({ chatCollapsed: b }),
     }),
     {
       name: "sf-setting-ui",
@@ -39,6 +45,7 @@ export const useSettingStore = create<SettingState>()(
       partialize: (s) => ({
         chatWidth: s.chatWidth,
         l2Collapsed: s.l2Collapsed,
+        chatCollapsed: s.chatCollapsed,
       }),
     }
   )

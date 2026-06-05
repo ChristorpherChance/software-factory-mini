@@ -19,11 +19,21 @@ import {
   BookOpen,
   MessageSquare,
   Check,
+  Download,
+  Undo2,
+  Redo2,
 } from "lucide-react";
 import { api, type MaterialDto, type UploadedFileDto } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Segmented } from "@/components/ui/segmented";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from "@/components/ui/dropdown-menu";
+import { downloadMarkdown, exportDocFromHtml, exportPdfFromHtml } from "@/lib/export";
 import { cn } from "@/lib/utils";
 
 // 资料视图（20260603 改版）：两个顶级标签
@@ -61,10 +71,16 @@ function parseDoc(content: string): { body: string; isJson: boolean; obj: any } 
 }
 
 /** 主内容区文档面板：拉取工件最新内容，渲染/编辑（Markdown）+ 保存回写新版本。复用于两个标签。 */
-function MaterialDocPanel({ pid, mid }: { pid: string; mid: string }) {
+function MaterialDocPanel({ pid, mid, title }: { pid: string; mid: string; title?: string }) {
   const qc = useQueryClient();
   const [view, setView] = useState<"render" | "edit">("render");
   const [draft, setDraft] = useState<string | null>(null);
+  // 撤销栈：编辑前的草稿快照（pop 一个即恢复上一步）
+  const [history, setHistory] = useState<string[]>([]);
+  // 重做栈（问题7）：撤销时把当前值压入；重做时弹出恢复；新编辑发生时清空
+  const [redo, setRedo] = useState<string[]>([]);
+  // 渲染态 <article> 引用：导出 doc/pdf 取其 innerHTML 以保留排版
+  const articleRef = useRef<HTMLElement>(null);
 
   const { data: art, isLoading } = useQuery({
     queryKey: ["material-doc", mid],
@@ -73,13 +89,16 @@ function MaterialDocPanel({ pid, mid }: { pid: string; mid: string }) {
   });
 
   const parsed = useMemo(() => parseDoc(art?.content ?? ""), [art?.content]);
+  // 编辑即时生效：渲染/编辑均用 shown；draft 非空即覆盖解析正文（问题7）
   const shown = draft ?? parsed.body;
   const dirty = draft != null && draft !== parsed.body;
 
-  // 切换文档时复位草稿与视图
+  // 切换文档时复位草稿、视图与撤销/重做栈（仅依赖 mid，view 切换不复位草稿）
   useEffect(() => {
     setDraft(null);
     setView("render");
+    setHistory([]);
+    setRedo([]);
   }, [mid]);
 
   const save = useMutation({
@@ -92,10 +111,39 @@ function MaterialDocPanel({ pid, mid }: { pid: string; mid: string }) {
     },
     onSuccess: () => {
       setDraft(null);
+      setHistory([]);
+      setRedo([]);
       qc.invalidateQueries({ queryKey: ["material-doc", mid] });
       qc.invalidateQueries({ queryKey: ["materials", pid] });
     },
   });
+
+  // 撤销（问题7）：把当前显示值压入 redo 栈，恢复到上一个 history 快照
+  const undo = () => {
+    setHistory((h) => {
+      if (h.length === 0) return h;
+      setRedo((r) => [...r, shown]); // 撤销前的当前值进入 redo
+      setDraft(h[h.length - 1]);
+      return h.slice(0, -1);
+    });
+  };
+
+  // 重做（问题7）：从 redo 栈弹出恢复，并把被恢复前的当前值压回 history
+  const redoEdit = () => {
+    setRedo((r) => {
+      if (r.length === 0) return r;
+      const cur = shown; // 重做前的当前值压回 history
+      setHistory((h) => (h.length > 0 && h[h.length - 1] === cur ? h : [...h, cur]));
+      setDraft(r[r.length - 1]);
+      return r.slice(0, -1);
+    });
+  };
+
+  // 导出文件名 + 已渲染 HTML（不在渲染态时回退为把源文本包进 <pre>）
+  const exportName = title || "资料正文";
+  const exportInnerHtml = () =>
+    articleRef.current?.innerHTML ??
+    `<pre>${shown.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>`;
 
   return (
     <section className="flex min-h-0 flex-col gap-2">
@@ -110,6 +158,57 @@ function MaterialDocPanel({ pid, mid }: { pid: string; mid: string }) {
               { value: "edit", label: "编辑" },
             ]}
           />
+          {/* 撤销：恢复草稿到上一步快照（栈空时禁用，问题7） */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={undo}
+            disabled={history.length === 0}
+            title={history.length === 0 ? "无可撤销的编辑" : "撤销上一步编辑"}
+          >
+            <Undo2 className="h-3.5 w-3.5" /> 撤销
+          </Button>
+          {/* 重做：从重做栈恢复（栈空时禁用，问题7） */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={redoEdit}
+            disabled={redo.length === 0}
+            title={redo.length === 0 ? "无可重做的编辑" : "重做下一步编辑"}
+          >
+            <Redo2 className="h-3.5 w-3.5" /> 重做
+          </Button>
+          {/* 导出下拉：Markdown / Word(.doc) / PDF(打印) */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                className="flex h-7 items-center gap-1 rounded-md border border-border bg-bg-elevated px-2 text-xs text-text-secondary hover:bg-bg-subtle"
+                title="下载 / 导出"
+              >
+                <Download className="h-3.5 w-3.5" /> 导出
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem
+                className="text-xs"
+                onSelect={() => downloadMarkdown(exportName, shown)}
+              >
+                下载 Markdown（.md）
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                className="text-xs"
+                onSelect={() => exportDocFromHtml(exportName, exportInnerHtml(), exportName)}
+              >
+                另存为 Word（.doc）
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                className="text-xs"
+                onSelect={() => exportPdfFromHtml(exportInnerHtml(), exportName)}
+              >
+                导出 PDF（打印）
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
           <Button
             variant="primary"
             size="sm"
@@ -126,12 +225,23 @@ function MaterialDocPanel({ pid, mid }: { pid: string; mid: string }) {
       ) : view === "edit" ? (
         <textarea
           value={shown}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => {
+            // 把改动前的值压入撤销栈（与栈顶去重）
+            const prev = shown;
+            setHistory((h) =>
+              h.length > 0 && h[h.length - 1] === prev ? h : [...h, prev]
+            );
+            setRedo([]); // 新编辑产生新分支，清空重做栈（问题7）
+            setDraft(e.target.value);
+          }}
           spellCheck={false}
           className="sf-scroll min-h-[40vh] w-full resize-none whitespace-pre-wrap rounded-md border border-border bg-bg-subtle p-3 font-mono text-[13px] leading-relaxed text-text outline-none focus:border-primary"
         />
       ) : shown.trim() ? (
-        <article className="prose prose-sm max-w-none rounded-md border border-border bg-bg p-4 text-text">
+        <article
+          ref={articleRef}
+          className="prose prose-sm max-w-none rounded-md border border-border bg-bg p-4 text-text"
+        >
           <ReactMarkdown remarkPlugins={[remarkGfm]}>{shown}</ReactMarkdown>
         </article>
       ) : (
@@ -455,7 +565,7 @@ function FileParseTab({ pid }: { pid: string }) {
             </div>
 
             {/* 文档正文：主内容区渲染 + 编辑（可保存为新版本） */}
-            <MaterialDocPanel pid={pid} mid={active.id} />
+            <MaterialDocPanel pid={pid} mid={active.id} title={active.title} />
 
             {/* 解析摘要 */}
             {active.summary && (
@@ -619,7 +729,7 @@ function ContentParseTab({ pid }: { pid: string }) {
             </div>
 
             {/* 文档正文：主内容区渲染 + 编辑（占主要空间，不被操作区遮挡） */}
-            <MaterialDocPanel pid={pid} mid={active.id} />
+            <MaterialDocPanel pid={pid} mid={active.id} title={active.title} />
 
             {/* 内容解析操作区：统一收进一张卡片，置于正文之后 */}
             <div className="space-y-3 rounded-lg border border-border bg-bg-subtle/60 p-4">
